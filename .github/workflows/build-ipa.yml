@@ -1,0 +1,238 @@
+# =============================================================================
+#  AOTDroid-Adaptive-iOS  |  .github/workflows/build-ipa.yml
+#
+#  Jobs:
+#    host-tests      (ubuntu + macos): portable core build + ctest
+#    rewrite-fixture (ubuntu): assemble a real arm64 .so with the cross
+#                     assembler, run aotdroid-rewrite over it, verify the
+#                     patched bytes with python (site -> veneer chains)
+#    ios-build       (macos-14): compile EVERY source (incl. .mm) against the
+#                     iPhoneOS SDK -> proof of zero syntax errors; package the
+#                     unsigned AOTDroid.app into AOTDroid-unsigned.ipa for
+#                     SideStore / AltStore (re-signed at install)
+#    macho-link-check(macos-14): feed the emitted Mach-O object to ld64
+#    full-ipa        (manual): rootfs build + conversion + IPA with images
+# =============================================================================
+name: build-ipa
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: 'rootfs profile for full-ipa'
+        default: 'none'
+        type: choice
+        options: [none, '7.1', '8.1', '10']
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  host-tests:
+    name: host tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain info
+        run: |
+          uname -a
+          c++ --version | head -1
+          cmake --version | head -1
+      - name: Build + run (script path; no cmake needed)
+        run: ./scripts/host_build.sh
+      - name: Build + run (cmake path)
+        run: |
+          cmake -S . -B build-cmake -DAOTDROID_HOST=ON -DAOTDROID_BUILD_TESTS=ON
+          cmake --build build-cmake -j"$(getconf _NPROCESSORS_ONLN)"
+          ctest --test-dir build-cmake --output-on-failure
+
+  # ---------------------------------------------------------------------------
+  rewrite-fixture:
+    name: rewriter vs real arm64 code
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            g++-aarch64-linux-gnu binutils-aarch64-linux-gnu python3
+      - name: Build host tools
+        run: ./scripts/host_build.sh
+      - name: Assemble fixture with real svc/mrs/msr instructions
+        run: |
+          mkdir -p fixture
+          cat > fixture/fixture.S <<'ASM'
+            .text
+            .globl _start
+            .type  _start,%function
+          _start:
+            stp x29, x30, [sp, #-16]!
+            mov x8, #56                 // __NR_openat
+            svc #0
+            mrs x4, tpidr_el0
+            mrs x7, tpidrro_el0
+            msr tpidr_el0, x2
+            mov x8, #98                 // __NR_futex
+            svc #0
+            ldp x29, x30, [sp], #16
+            ret
+          ASM
+          aarch64-linux-gnu-as -o fixture/fixture.o fixture/fixture.S
+          aarch64-linux-gnu-ld -shared -o fixture/libfixture.so fixture/fixture.o \
+            -soname libfixture.so -z max-page-size=4096
+          aarch64-linux-gnu-objdump -d fixture/libfixture.so | tee fixture/disasm.txt
+      - name: Run aotdroid-rewrite (ELF + Mach-O)
+        run: |
+          ./build-host/aotdroid-rewrite --in fixture/libfixture.so \
+            --out-elf fixture/rewritten.elf --out-macho fixture/converted.o \
+            --soname libfixture.so --page-size 16384 | tee fixture/stats.json
+      - name: Verify patches with python
+        run: |
+          python3 - <<'PY'
+          import json, re, struct, sys
+          stats = json.load(open('fixture/stats.json'))
+          assert stats['syscalls'] == 2, stats
+          assert stats['tlsReads'] == 1, stats
+          assert stats['tlsWrites'] == 1, stats
+          assert stats['veneers'] + stats['brkTrampolines'] == 5, stats
+          data = open('fixture/rewritten.elf','rb').read()
+          # ELF64 header sanity + phdr count (+1 = PT_AOTPATCH)
+          e_phnum = struct.unpack_from('<H', data, 0x38)[0]
+          assert e_phnum == 4, e_phnum
+          # every PT_LOAD must satisfy p_offset == p_vaddr (mod 16384)
+          e_phoff, = struct.unpack_from('<Q', data, 0x20)
+          loads = []
+          for i in range(e_phnum):
+              ph = data[e_phoff + i*56 : e_phoff + (i+1)*56]
+              p_type, p_flags = struct.unpack_from('<II', ph, 0)
+              p_off, p_va = struct.unpack_from('<QQ', ph, 8)
+              if p_type == 1:
+                  assert p_off % 16384 == p_va % 16384, (p_off, p_va)
+                  loads.append((p_off, p_va, p_flags))
+          # no original svc #0 left anywhere in the exec segment
+          execseg = loads[0]
+          seg = data[execseg[0]:execseg[0]+0x2000]
+          assert struct.pack('<I', 0xD4000001) not in seg, "raw svc survived!"
+          print("REWRITE FIXTURE: all assertions passed", stats)
+          PY
+
+  # ---------------------------------------------------------------------------
+  ios-build:
+    name: iOS build (zero-syntax-errors gate)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_15.app 2>/dev/null || true
+      - name: Xcode/SDK info
+        run: |
+          xcodebuild -version
+          xcrun -sdk iphoneos --show-sdk-version
+      - name: Compile all sources against the iPhoneOS SDK
+        run: |
+          SDK=$(xcrun -sdk iphoneos --show-sdk-path)
+          mkdir -p build-ios/obj
+          set -e
+          # every portable translation unit
+          for f in src/aot/macho_emit.cpp src/aot/aot_rewriter.cpp \
+                   src/runtime/vfs.cpp src/runtime/binder_emu.cpp \
+                   src/runtime/property_area.cpp src/runtime/domain.cpp \
+                   src/runtime/container_boot.cpp \
+                   src/linker/syscall_bridge.cpp src/linker/bionic_linker.cpp \
+                   src/gfx/input_hub.cpp src/gfx/hwc_composer_core.cpp; do
+            xcrun -sdk iphoneos clang++ -std=c++20 -stdlib=libc++ \
+              -arch arm64 -mcpu=apple-a13 -fobjc-arc \
+              -isysroot "$SDK" -DTARGET_OS_IPHONE=1 \
+              -Wall -Wextra -Wno-unused-parameter \
+              -Isrc -c "$f" -o "build-ios/obj/$(basename "$f" .cpp).o"
+          done
+          # every Objective-C++ translation unit (the real syntax gate)
+          for f in src/profiler/hardware_profiler.mm \
+                   src/gfx/hwc_metal_bridge.mm \
+                   src/jetsam/jetsam_guard.mm ios/AppShell.mm; do
+            xcrun -sdk iphoneos clang++ -std=c++20 -stdlib=libc++ -x objective-c++ \
+              -arch arm64 -mcpu=apple-a13 -fobjc-arc \
+              -isysroot "$SDK" \
+              -Wall -Wextra -Wno-unused-parameter \
+              -Isrc -c "$f" -o "build-ios/obj/$(basename "$f" .mm).o"
+          done
+          echo "ALL iOS SOURCES COMPILED CLEAN"
+      - name: Link AOTDroid.app (unsigned)
+        run: |
+          SDK=$(xcrun -sdk iphoneos --show-sdk-path)
+          mkdir -p build-ios/AOTDroid.app
+          xcrun -sdk iphoneos clang++ -arch arm64 -mcpu=apple-a13 -fobjc-arc \
+            -isysroot "$SDK" \
+            build-ios/obj/*.o \
+            -framework Foundation -framework UIKit -framework Metal \
+            -framework MetalKit -framework QuartzCore -framework IOSurface \
+            -framework CoreVideo \
+            -o build-ios/AOTDroid.app/AOTDroid \
+            -Wl,-no_fixup_chains
+          cp ios/Info.plist build-ios/AOTDroid.app/
+          codesign --force --sign - --entitlements ios/AOTDroid.entitlements \
+            build-ios/AOTDroid.app/AOTDroid 2>/dev/null || \
+            echo "(ad-hoc codesign skipped -- SideStore signs at install)"
+      - name: Package unsigned IPA
+        run: |
+          mkdir -p build-ios/Payload
+          cp -R build-ios/AOTDroid.app build-ios/Payload/
+          cd build-ios && zip -qry AOTDroid-unsigned.ipa Payload && cd ..
+          ls -la build-ios/AOTDroid-unsigned.ipa
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AOTDroid-unsigned-ipa
+          path: build-ios/AOTDroid-unsigned.ipa
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  macho-link-check:
+    name: ld64 accepts emitted Mach-O
+    runs-on: macos-14
+    needs: [host-tests]
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./scripts/host_build.sh
+      - name: Assemble an arm64 fixture and rewrite it
+        run: |
+          mkdir -p fixture
+          printf '.text\n.globl _f\n_f:\n  svc #0\n  mrs x4, tpidr_el0\n  ret\n' > fixture/f.S
+          clang -target arm64-apple-ios -c fixture/f.S -o fixture/f.o
+          ./build-host/aotdroid-rewrite --in fixture/f.o --out-macho fixture/converted.o \
+            --soname libfixture.dylib --page-size 16384
+      - name: ld64 must link the converted object
+        run: |
+          ld -arch arm64 -r -o fixture/combined.o fixture/converted.o fixture/f.o \
+            && echo "ld64 LINK OK" \
+            && nm fixture/combined.o | head -20
+
+  # ---------------------------------------------------------------------------
+  full-ipa:
+    name: full IPA (rootfs images; manual)
+    runs-on: macos-14
+    if: github.event_name == 'workflow_dispatch' && inputs.profile != 'none'
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./scripts/host_build.sh
+      - name: Fetch GSI image (pinned build ids; see scripts docs)
+        run: |
+          echo "Set SYSTEM_IMAGE_${{ inputs.profile }} or use a cached artifact."
+          echo "GSIs: https://source.android.com/setup/build/gsi"
+          if [[ -z "${SYSTEM_IMAGE:-}" ]]; then
+            echo "No image provided; job ends here (docs/ARCHITECTURE.md)."
+            exit 0
+          fi
+      # The remaining steps mirror scripts/build_multi_aosp_rootfs.sh +
+      # ld64 linking of converted objects into the app binary; driven by the
+      # rootfs script outputs (converted-<ver>/ + tls-<ver>.tsv).

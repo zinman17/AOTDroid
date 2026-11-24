@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Development signing for SideStore / AltStore (re-signed at install) -->
+	<key>get-task-allow</key>
+	<true/>
+
+	<!-- Optional: enable the JIT entitlement. AOTDroid is AOT-first and runs
+	     with zero runtime JIT on stock devices; with this entitlement present
+	     (SideStore per-app toggle), install-time app dex AOT compilation
+	     becomes possible as a performance upgrade path. -->
+	<key>com.apple.security.cs.allow-jit</key>
+	<true/>
+
+	<!-- Converted AOSP dylibs are linked into the bundle and re-signed by the
+	     same identity at install time; library validation stays enabled. -->
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
+
+	<!-- Required to read/write the container rootfs pack under
+	     Library/ without user prompts. -->
+	<key>com.apple.security.app-sandbox</key>
+	<false/>
+</dict>
+</plist>

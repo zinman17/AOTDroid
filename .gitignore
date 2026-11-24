@@ -1,0 +1,11 @@
+build*/
+*.o
+*.a
+*.ipa
+*.zip
+DerivedData/
+*.img
+*.aotpack
+rootfs-out/
+third_party/angle/
+.DS_Store
