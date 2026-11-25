@@ -116,7 +116,7 @@
 - (void)bootNow:(UIButton*)sender {
   (void)sender;
   // 1. Jetsam guard first: never allocate before the pressure hooks exist.
-  jetsamGuardInstall(nil);
+  aotdroid::jetsamGuardInstall(nil);
 
   // 2. Container boot: rootfs pack + binder domains + properties + init.
   aotdroid::BootConfig cfg;
@@ -130,7 +130,7 @@
     [s appendFormat:@"\n[boot] container up (init domain %u, %zu property bytes)",
         r.initDomain, r.propertyBytes];
     // 3. Metal presentation host at the profiled framebuffer geometry.
-    hwcMetalAttachToView((__bridge void*)self,
+    aotdroid::hwcMetalAttachToView((__bridge void*)self,
                          ((NSNumber*)_profile[@"fbW"]).unsignedIntValue,
                          ((NSNumber*)_profile[@"fbH"]).unsignedIntValue,
                          96 * 1024 * 1024);

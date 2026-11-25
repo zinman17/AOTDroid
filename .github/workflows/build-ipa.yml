@@ -214,16 +214,68 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: ./scripts/host_build.sh
-      - name: Assemble an arm64 fixture and rewrite it
+      - name: Build ELF fixture (python) and rewrite to Mach-O
         run: |
           mkdir -p fixture
-          printf '.text\n.globl _f\n_f:\n  svc #0\n  mrs x4, tpidr_el0\n  ret\n' > fixture/f.S
-          clang -target arm64-apple-ios -c fixture/f.S -o fixture/f.o
-          ./build-host/aotdroid-rewrite --in fixture/f.o --out-macho fixture/converted.o \
-            --soname libfixture.dylib --page-size 16384
+          # macOS has no Linux linker, so the ET_DYN ELF input is synthesized
+          # here (same layout the rewriter accepts); the ubuntu fixture job
+          # covers real-toolchain (.S -> as -> ld -> .so) input end to end.
+          python3 - <<'PY'
+          import struct
+          PAGE = 4096
+          text = [0xA9BF7BFD, 0xD4000001, 0xD53BD047, 0xD53BD064, 0xD51BD042,
+                  0xAA1F03E0, 0xD503201F, 0xA8C17BFD, 0xD65F03C0]
+          ts = len(text) * 4
+          phnum = 3
+          phoff = 64
+          toff = (phoff + phnum * 56 + 63) & ~63
+          roff = toff + ts
+          doff = PAGE; dsz = 64
+          dyoff = doff + dsz; dync = 8
+          shstr = dyoff + dync * 16; shstrsz = 128
+          dstr = shstr + shstrsz; dstrsz = 128
+          dsym = dstr + dstrsz
+          shoff = dsym + 3 * 24
+          total = shoff + 8 * 64
+          b = bytearray(total)
+          for i, w in enumerate(text):
+              struct.pack_into('<I', b, toff + i * 4, w)
+          def phdr(i, t, fl, off, va, fsz, msz, al):
+              o = phoff + i * 56
+              struct.pack_into('<II', b, o, t, fl)
+              struct.pack_into('<QQ', b, o + 8, off, va)
+              struct.pack_into('<QQ', b, o + 24, off, va)
+              struct.pack_into('<QQ', b, o + 32, fsz, msz)
+              struct.pack_into('<Q', b, o + 48, al)
+          phdr(0, 1, 5, 0, 0, doff, doff, PAGE)              # PT_LOAD R+X
+          phdr(1, 1, 6, doff, PAGE, dsz, dsz, PAGE)         # PT_LOAD R+W
+          phdr(2, 2, 4, dyoff, PAGE + dyoff - doff,
+               dync * 16, dync * 16, 8)                     # PT_DYNAMIC
+          struct.pack_into('<QQq', b, roff, PAGE, 1027, toff)  # RELATIVE -> .text
+          dyn = [(5, PAGE + dstr - doff), (11, PAGE + dsym - doff), (10, dstrsz),
+                 (12, 24), (7, PAGE + roff - doff), (8, 24), (9, 24), (0, 0)]
+          for i, (t, v) in enumerate(dyn):
+              struct.pack_into('<qQ', b, dyoff + i * 16, t, v)
+          b[shstr:shstr + 40] = b"\0.text\0.rela.dyn\0.dynstr\0.dynsym\0.shstrtab\0.data\0"
+          b[dstr:dstr + 24] = b"\0libaot_test.so\0test_sym\0"
+          struct.pack_into('<IBBHQQ', b, dsym + 24, 16, 0x12, 0, 1, toff + 12 * 4, 0)
+          b[0:4] = b"\x7fELF"
+          struct.pack_into('<BBBB', b, 4, 2, 1, 1, 0)
+          struct.pack_into('<HHI', b, 16, 3, 183, 1)
+          struct.pack_into('<QQQ', b, 24, toff, phoff, shoff)
+          struct.pack_into('<HHHHHH', b, 52, 64, 56, phnum, 64, 8, 5)
+          open('fixture/libfixture.so', 'wb').write(b)
+          print('fixture ELF built:', len(b), 'bytes')
+          PY
+          ./build-host/aotdroid-rewrite --in fixture/libfixture.so \
+            --out-macho fixture/converted.o \
+            --soname libfixture.so --page-size 16384
       - name: ld64 must link the converted object
         run: |
-          ld -arch arm64 -r -o fixture/combined.o fixture/converted.o fixture/f.o \
+          # separate partner object (distinct symbol) assembled natively
+          printf '.text\n.globl _partner\n_partner:\n  ret\n' > fixture/p.S
+          clang -target arm64-apple-macosx -c fixture/p.S -o fixture/p.o
+          ld -arch arm64 -r -o fixture/combined.o fixture/converted.o fixture/p.o \
             && echo "ld64 LINK OK" \
             && nm fixture/combined.o | head -20
 

@@ -162,6 +162,7 @@ id<MTLTexture> textureForBuffer(CVPixelBufferRef pb, uint32_t key) {
   return tex;
 }
 }  // namespace
+}  // namespace aotdroid   (ObjC classes below must live at global scope)
 
 @interface AOTMetalView : UIView
 @end
@@ -171,29 +172,33 @@ id<MTLTexture> textureForBuffer(CVPixelBufferRef pb, uint32_t key) {
   [super touchesBegan:t withEvent:e];
   for (UITouch* touch in t) {
     CGPoint p = [touch locationInView:self];
-    hwcMetalPushTouch(0, (uint64_t)(uintptr_t)touch, p.x / self.bounds.size.width,
-                      p.y / self.bounds.size.height);
+    aotdroid::hwcMetalPushTouch(0, (uint64_t)(uintptr_t)touch,
+                                p.x / self.bounds.size.width,
+                                p.y / self.bounds.size.height);
   }
 }
 - (void)touchesMoved:(NSSet<UITouch*>*)t withEvent:(UIEvent*)e {
   [super touchesMoved:t withEvent:e];
   for (UITouch* touch in t) {
     CGPoint p = [touch locationInView:self];
-    hwcMetalPushTouch(1, (uint64_t)(uintptr_t)touch, p.x / self.bounds.size.width,
-                      p.y / self.bounds.size.height);
+    aotdroid::hwcMetalPushTouch(1, (uint64_t)(uintptr_t)touch,
+                                p.x / self.bounds.size.width,
+                                p.y / self.bounds.size.height);
   }
 }
 - (void)touchesEnded:(NSSet<UITouch*>*)t withEvent:(UIEvent*)e {
   [super touchesEnded:t withEvent:e];
   for (UITouch* touch in t) {
     CGPoint p = [touch locationInView:self];
-    hwcMetalPushTouch(2, (uint64_t)(uintptr_t)touch, p.x / self.bounds.size.width,
-                      p.y / self.bounds.size.height);
+    aotdroid::hwcMetalPushTouch(2, (uint64_t)(uintptr_t)touch,
+                                p.x / self.bounds.size.width,
+                                p.y / self.bounds.size.height);
   }
 }
 - (void)touchesCancelled:(NSSet<UITouch*>*)t withEvent:(UIEvent*)e {
   [super touchesCancelled:t withEvent:e];
-  for (UITouch* touch in t) hwcMetalPushTouch(2, (uint64_t)(uintptr_t)touch, 0, 0);
+  for (UITouch* touch in t)
+    aotdroid::hwcMetalPushTouch(2, (uint64_t)(uintptr_t)touch, 0, 0);
 }
 @end
 
@@ -204,11 +209,12 @@ id<MTLTexture> textureForBuffer(CVPixelBufferRef pb, uint32_t key) {
 @end
 @implementation AOTDisplayLinkTarget
 - (void)tick:(CADisplayLink*)dl {
-  HwcComposerCore::get().vsyncTick();
+  aotdroid::HwcComposerCore::get().vsyncTick();
   (void)dl;
 }
 @end
 
+namespace aotdroid {
 namespace {
 void presentRequest(const PresentRequest& req) {
   if (!g_layer || !g_queue) return;
@@ -257,7 +263,7 @@ void* hwcMetalAttachToView(void* uivc, uint32_t fbW, uint32_t fbH,
   AOTMetalView* view = [[AOTMetalView alloc] initWithFrame:vc.view.bounds];
   g_layer = (CAMetalLayer*)view.layer;
   g_layer.device = g_device;
-  g_layer.pixelFormat = MTLPixelFormatBGRA8;
+  g_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
   g_layer.drawableSize = CGSizeMake(fbW, fbH);
   g_layer.framebufferOnly = NO;   // gralloc buffers are shared CPU/GPU
   [vc.view addSubview:view];
