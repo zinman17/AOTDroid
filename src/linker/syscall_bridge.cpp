@@ -12,6 +12,10 @@
 #ifdef AOTDROID_APPLE
 #include <os/proc.h>
 #include <CommonCrypto/CommonRandom.h>
+// NOTE: dispatch must be included at global scope, NEVER inside a namespace:
+// dispatch/time.h forward-declares `struct timespec`, which would otherwise
+// declare an incomplete aotdroid::timespec and hijack later lookups.
+#include <dispatch/dispatch.h>
 #endif
 
 namespace aotdroid {
@@ -369,10 +373,6 @@ int timerfdCreate(int clockid, int flags) {
   return -ENOSYS;
 #endif
 }
-
-#ifdef AOTDROID_APPLE
-#include <dispatch/dispatch.h>
-#endif
 
 int timerfdSettime(int fd, int flags, const LinuxTimespec* itValue,
                    const LinuxTimespec* itInterval, LinuxTimespec* oldValue) {

@@ -371,7 +371,7 @@ bool AotRewriter::rewriteBuffer(const uint8_t* in, size_t inLen,
   // =========================================================================
   if (outElf) {
     size_t totalFile = 0;
-    for (const Seg& s : c.segs) totalFile = std::max(totalFile, s.newOff + s.ph.p_filesz);
+    for (const Seg& s : c.segs) totalFile = std::max(totalFile, (size_t)(s.newOff + s.ph.p_filesz));
     const size_t patchSegOff = align_up(totalFile, ps);
     const size_t patchSegVa = align_up(nextVa, ps);
 
