@@ -8,6 +8,7 @@
 #include "pack_writer.h"
 #include "../platform/sys_compat.h"
 #include <dirent.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <algorithm>
@@ -60,6 +61,76 @@ std::string nowUtcIso() {
   char b[32];
   strftime(b, sizeof(b), "%Y-%m-%dT%H:%M:%SZ", &tmv);
   return b;
+}
+
+// ---------------------------------------------------------------------------
+// pack directory selection
+//
+// The pack, its .tmp staging file and rootfs.json are written into the FIRST
+// container location that actually accepts the real operation:
+//   1. the container root itself              (host tools + CI layout)
+//   2. Library/Application Support/AOTDroid   (iOS standard, hidden)
+//   3. Documents                               (iOS standard, Files-visible)
+//   4. tmp                                     (last resort; OS may purge)
+// Why: on some sideloaded (SideStore/AltStore re-signed) installs,
+// open(O_CREAT) in the data-container ROOT fails with EPERM even though
+// Library/ and Documents/ are writable -- the importer used to die with
+// "pack: create: Operation not permitted" before writing a single byte.
+// Probing keeps host/CI behavior identical (root wins there) and routes
+// iOS into whichever standard directory the sandbox actually allows.
+// ---------------------------------------------------------------------------
+bool mkdirs(const std::string& dir) {
+  if (dir.empty()) return false;
+  if (isDirPath(dir)) return true;
+  std::string cur;
+  size_t i = 0;
+  if (dir[0] == '/') { cur = "/"; i = 1; }
+  while (i <= dir.size()) {
+    size_t j = dir.find('/', i);
+    if (j == std::string::npos) j = dir.size();
+    if (j > i) {
+      cur += dir.substr(i, j - i);
+      if (::mkdir(cur.c_str(), 0755) != 0 && errno != EEXIST) return false;
+    }
+    cur += '/';
+    i = j + 1;
+  }
+  return isDirPath(dir);
+}
+
+// 0 = writable; otherwise the errno of the failed probe. The probe file
+// mirrors the exact name pattern + open flags of a real pack write so a
+// name- or flag-specific denial is caught too.
+int probeDirErrno(const std::string& dir) {
+  std::string probe = dir + "/rootfs-probe.aotpack.tmp";
+  int fd = ::open(probe.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (fd < 0) return errno;
+  int e = ::write(fd, "ok", 2) == 2 ? 0 : errno;
+  ::close(fd);
+  ::unlink(probe.c_str());
+  return e;
+}
+
+std::vector<std::string> packDirCandidates(const std::string& root) {
+  return { root,
+           root + "/Library/Application Support/AOTDroid",
+           root + "/Documents",
+           root + "/tmp" };
+}
+
+std::string writablePackDir(const std::string& containerRoot, std::string* err) {
+  std::string why;
+  for (const auto& d : packDirCandidates(containerRoot)) {
+    if (!mkdirs(d)) {
+      why += d + " mkdir: " + strerror(errno) + "; ";
+      continue;
+    }
+    int e = probeDirErrno(d);
+    if (e == 0) return d;
+    why += d + " create: " + strerror(e) + "; ";
+  }
+  *err = "no writable pack directory in app container [" + why + "]";
+  return "";
 }
 
 // build.prop "key=value" scan
@@ -396,6 +467,9 @@ bool RootfsManager::importFromImage(const std::string& srcPath,
                                     std::string* err) {
   FileBlockSource fbs;
   if (!fbs.open(srcPath, err)) return false;
+  std::string perr;
+  std::string pdir = writablePackDir(containerRoot, &perr);
+  if (pdir.empty()) { *err = perr; return false; }
   SparseBlockSource sbs;
   if (!sbs.open(&fbs, err)) return false;
   Ext4Reader fs;
@@ -417,7 +491,7 @@ bool RootfsManager::importFromImage(const std::string& srcPath,
   p.entriesTotal = c.files + c.dirs + c.symlinks;
   if (progress) progress(p);
 
-  std::string outPath = containerRoot + "/rootfs-" + tag + ".aotpack";
+  std::string outPath = pdir + "/rootfs-" + tag + ".aotpack";
   PackWriter w;
   if (!w.begin(outPath, err)) return false;
   WalkCounts wc;
@@ -453,7 +527,7 @@ bool RootfsManager::importFromImage(const std::string& srcPath,
   st.fileCount = wc.files;
   st.dirCount = wc.dirs;
   st.symlinkCount = wc.symlinks;
-  if (!writeManifest(manifestPath(containerRoot), st)) {
+  if (!writeManifest(pdir + "/rootfs.json", st)) {
     *err = "manifest write";
     return false;
   }
@@ -469,6 +543,9 @@ bool RootfsManager::importFromZip(const std::string& srcPath,
                                   std::string* err) {
   ZipReader z;
   if (!z.open(srcPath, err)) return false;
+  std::string perr;
+  std::string pdir = writablePackDir(containerRoot, &perr);
+  if (pdir.empty()) { *err = perr; return false; }
 
   const ZipReader::Entry* sysImg = nullptr;
   const ZipReader::Entry* venImg = nullptr;
@@ -492,7 +569,7 @@ bool RootfsManager::importFromZip(const std::string& srcPath,
       base = &zsrc;
       if (!sbs.open(base, err)) return false;
     } else {
-      std::string tmp = containerRoot + "/rootfs-import-tmp.img";
+      std::string tmp = pdir + "/rootfs-import-tmp.img";
       ImportProgress p;
       p.phase = "unpack";
       p.fraction = 0.04f;
@@ -531,7 +608,7 @@ bool RootfsManager::importFromZip(const std::string& srcPath,
     p.entriesTotal = c.files + c.dirs + c.symlinks;
     if (progress) progress(p);
 
-    std::string outPath = containerRoot + "/rootfs-" + tag + ".aotpack";
+    std::string outPath = pdir + "/rootfs-" + tag + ".aotpack";
     PackWriter w;
     if (!w.begin(outPath, err)) {
       if (haveTmp) removeTree(containerRoot + "/rootfs-import-tmp.img");
@@ -586,7 +663,7 @@ bool RootfsManager::importFromZip(const std::string& srcPath,
     st.fileCount = wc.files;
     st.dirCount = wc.dirs;
     st.symlinkCount = wc.symlinks;
-    if (!writeManifest(manifestPath(containerRoot), st)) {
+    if (!writeManifest(pdir + "/rootfs.json", st)) {
       *err = "manifest write";
       return false;
     }
@@ -636,7 +713,7 @@ bool RootfsManager::importFromZip(const std::string& srcPath,
   p.entriesTotal = nFiles + nDirs + nLinks;
   if (progress) progress(p);
 
-  std::string outPath = containerRoot + "/rootfs-" + tag + ".aotpack";
+  std::string outPath = pdir + "/rootfs-" + tag + ".aotpack";
   PackWriter w;
   if (!w.begin(outPath, err)) return false;
   for (const ZipReader::Entry* e : sel) {
@@ -700,7 +777,7 @@ bool RootfsManager::importFromZip(const std::string& srcPath,
   st.fileCount = nFiles;
   st.dirCount = nDirs;
   st.symlinkCount = nLinks;
-  if (!writeManifest(manifestPath(containerRoot), st)) {
+  if (!writeManifest(pdir + "/rootfs.json", st)) {
     *err = "manifest write";
     return false;
   }
@@ -721,8 +798,13 @@ RootfsStatus RootfsManager::status(const std::string& containerRoot) {
   st.apiLevel = apiForTag(tag);
   struct stat s {};
   if (::stat(pack.c_str(), &s) == 0) st.packBytes = (uint64_t)s.st_size;
-  // manifest fields (if present)
-  FILE* f = fopen(manifestPath(containerRoot).c_str(), "r");
+  // manifest lives next to the pack; fall back to the legacy container-root
+  // copy for installs made before pack directories were introduced
+  std::string mdir = pack;
+  size_t slash = mdir.rfind('/');
+  if (slash != std::string::npos) mdir.resize(slash);
+  FILE* f = fopen((mdir + "/rootfs.json").c_str(), "r");
+  if (!f) f = fopen(manifestPath(containerRoot).c_str(), "r");
   if (f) {
     std::string text;
     char buf[4096];
@@ -752,16 +834,19 @@ RootfsStatus RootfsManager::status(const std::string& containerRoot) {
 bool RootfsManager::remove(const std::string& containerRoot, std::string* err) {
   (void)err;
   bool any = false;
-  for (const auto& n : listDirNames(containerRoot)) {
-    if (n.rfind("rootfs-", 0) == 0 &&
-        (n.find(".aotpack") != std::string::npos ||
-         n.find(".aotpack.tmp") != std::string::npos)) {
-      removeTree(containerRoot + "/" + n);
-      any = true;
+  for (const auto& d : packDirCandidates(containerRoot)) {
+    for (const auto& n : listDirNames(d)) {
+      if (n.rfind("rootfs-", 0) == 0 && n.find(".aotpack") != std::string::npos) {
+        removeTree(d + "/" + n);
+        any = true;
+      }
     }
+    removeTree(d + "/rootfs-import-tmp.img");
+    removeTree(d + "/rootfs.json");
   }
-  removeTree(manifestPath(containerRoot));
-  removeTree(containerRoot + "/rootfs-import-tmp.img");
+  // best effort: drop the (now empty) AOTDroid subdir we may have created
+  std::string sub = containerRoot + "/Library/Application Support/AOTDroid";
+  if (isDirPath(sub) && listDirNames(sub).empty()) ::rmdir(sub.c_str());
   return any;
 }
 
@@ -770,27 +855,43 @@ std::string RootfsManager::resolvePackPath(const std::string& containerRoot,
                                            std::string* actualTag) {
   std::string best;
   struct stat bestSt {};
-  for (const auto& n : listDirNames(containerRoot)) {
-    if (n.rfind("rootfs-", 0) != 0) continue;
-    if (n.size() < 8 + 8 || n.substr(n.size() - 8) != ".aotpack") continue;
-    std::string tag = n.substr(7, n.size() - 7 - 8);   // strip rootfs- and .aotpack
-    std::string full = containerRoot + "/" + n;
-    struct stat s {};
-    if (::stat(full.c_str(), &s) != 0 || s.st_size < 64) continue;
-    bool better = false;
-    if (wantTag.empty()) {
-      better = best.empty() || s.st_mtime > bestSt.st_mtime;
-    } else {
-      if (tag == wantTag) better = best.empty() || s.st_mtime > bestSt.st_mtime;
-      else if (best.empty()) better = true;   // fallback candidate
-    }
-    if (better) {
-      best = full;
-      bestSt = s;
-      if (actualTag) *actualTag = tag;
+  for (const auto& dir : packDirCandidates(containerRoot)) {
+    for (const auto& n : listDirNames(dir)) {
+      if (n.rfind("rootfs-", 0) != 0) continue;
+      if (n.size() < 8 + 8 || n.substr(n.size() - 8) != ".aotpack") continue;
+      std::string tag = n.substr(7, n.size() - 7 - 8);   // strip rootfs- and .aotpack
+      std::string full = dir + "/" + n;
+      struct stat s {};
+      if (::stat(full.c_str(), &s) != 0 || s.st_size < 64) continue;
+      bool better = false;
+      if (wantTag.empty()) {
+        better = best.empty() || s.st_mtime > bestSt.st_mtime;
+      } else {
+        if (tag == wantTag) better = best.empty() || s.st_mtime > bestSt.st_mtime;
+        else if (best.empty()) better = true;   // fallback candidate
+      }
+      if (better) {
+        best = full;
+        bestSt = s;
+        if (actualTag) *actualTag = tag;
+      }
     }
   }
   return best;
+}
+
+std::vector<std::string> RootfsManager::installedTags(
+    const std::string& containerRoot) {
+  std::vector<std::string> out;
+  for (const auto& dir : packDirCandidates(containerRoot))
+    for (const auto& n : listDirNames(dir)) {
+      if (n.rfind("rootfs-", 0) != 0) continue;
+      if (n.size() < 8 + 8 || n.substr(n.size() - 8) != ".aotpack") continue;
+      std::string tag = n.substr(7, n.size() - 7 - 8);
+      if (std::find(out.begin(), out.end(), tag) == out.end())
+        out.push_back(tag);
+    }
+  return out;
 }
 
 }  // namespace aotdroid

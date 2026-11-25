@@ -61,9 +61,13 @@ class RootfsManager {
   bool remove(const std::string& containerRoot, std::string* err);
 
   // Preferred pack for the wanted tag; falls back to any installed pack.
+  // Scans every candidate pack directory (container root, then the standard
+  // iOS Library/Application Support + Documents + tmp fallbacks).
   static std::string resolvePackPath(const std::string& containerRoot,
                                      const std::string& wantTag,
                                      std::string* actualTag);
+  // Tags of every installed pack, across all candidate directories.
+  static std::vector<std::string> installedTags(const std::string& containerRoot);
   static std::string tagForApiLevel(int api);
   static int apiForTag(const std::string& tag);
   static std::string manifestPath(const std::string& containerRoot);

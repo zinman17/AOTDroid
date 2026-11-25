@@ -376,12 +376,15 @@
         ++okCount;
         aotdroid::RootfsStatus st =
             aotdroid::RootfsManager::get().status([home UTF8String]);
+        NSString* loc = [NSString stringWithUTF8String:st.packPath.c_str()];
+        loc = [loc stringByReplacingOccurrencesOfString:home withString:@"~"];
         [weakSelf logLine:[NSString stringWithFormat:
-            @"[rootfs] -> installed %@ (Android %@, API %d): %u files, %llu MB",
+            @"[rootfs] -> installed %@ (Android %@, API %d): %u files, "
+            @"%llu MB at %@",
             [NSString stringWithUTF8String:st.profileTag.c_str()],
             [NSString stringWithUTF8String:st.androidVersion.c_str()],
             st.apiLevel, st.fileCount,
-            (unsigned long long)(st.packBytes / 1048576)]];
+            (unsigned long long)(st.packBytes / 1048576), loc]];
       } else {
         [weakSelf logLine:[NSString stringWithFormat:
             @"[rootfs] -> FAILED: %s", err.c_str()]];
@@ -389,11 +392,9 @@
     }
     // summary: list every installed pack for the boot selector
     NSMutableArray<NSString*>* tags = [NSMutableArray array];
-    for (NSString* n in [[NSFileManager defaultManager]
-            contentsOfDirectoryAtPath:home error:nil]) {
-      if ([n hasPrefix:@"rootfs-"] && [n hasSuffix:@".aotpack"] && n.length > 15)
-        [tags addObject:[n substringWithRange:NSMakeRange(7, n.length - 15)]];
-    }
+    for (const std::string& t :
+        aotdroid::RootfsManager::installedTags([home UTF8String]))
+      [tags addObject:[NSString stringWithUTF8String:t.c_str()]];
     dispatch_async(dispatch_get_main_queue(), ^{
       AOTDroidViewController* s = weakSelf;
       if (!s) return;

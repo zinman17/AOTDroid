@@ -34,7 +34,10 @@ bool PackWriter::begin(const std::string& outPath, std::string* err) {
   outPath_ = outPath;
   tmpPath_ = outPath + ".tmp";
   fd_ = ::open(tmpPath_.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-  if (fd_ < 0) { *err = std::string("pack: create: ") + strerror(errno); return false; }
+  if (fd_ < 0) {
+    *err = "pack: create " + tmpPath_ + ": " + strerror(errno);
+    return false;
+  }
   return true;
 }
 
