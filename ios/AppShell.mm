@@ -17,6 +17,7 @@
 @end
 
 @interface AOTDroidViewController : UIViewController <UIDocumentPickerDelegate>
++ (void)appendType:(NSString*)ident toArray:(NSMutableArray<UTType*>*)arr;
 @end
 
 @implementation AOTDroidAppDelegate
@@ -234,8 +235,8 @@
       aotdroid::RootfsManager::get().status([NSHomeDirectory() UTF8String]);
   if (!st.installed) {
     _rootfsTitle.text = @"No rootfs installed";
-    _rootfsDetail.text = @"tap '+ Add RootFS' and pick a GSI .zip "
-                         "(system.img inside) or .img";
+    _rootfsDetail.text = @"tap '+ Add RootFS' and pick one or more GSI "
+                         ".zip (system.img inside) or .img files";
     _bootBtn.alpha = 0.45;
     _bootBtn.enabled = NO;
     _removeBtn.enabled = NO;
@@ -255,22 +256,45 @@
 }
 
 // ---------------------------------------------------------------------------
-// Add RootFS: document picker -> background import -> pack
+// Add RootFS: document picker (multi-select, copy mode) -> batch import.
+//
+// Sideloaded-app picker bug fixed here with three cooperating changes:
+//  1. CONCRETE UTTypes only. The picker silently ignores physical UTIs such
+//     as public.data; with nothing allowed, every file in the Files app is
+//     greyed out and untappable -- the classic "can't select files" bug on
+//     SideStore/AltStore installs. public.zip-archive covers GSI .zip
+//     archives, public.disk-image covers raw/sparse .img system images.
+//  2. asCopy:YES. The picker hands us a sandbox-local copy under tmp/
+//     instead of an open-in-place security scope. Re-signed sideloaded apps
+//     frequently fail the scope grant (entitlements are rewritten at install
+//     time); a plain copy sidesteps it entirely. We delete the copy after
+//     the import so a 1-2 GB GSI does not eat the container twice.
+//  3. allowsMultipleSelection: import every picked GSI in one batch; each
+//     becomes its own rootfs-<tag>.aotpack (packs coexist; the boot-override
+//     buttons pick which one boots).
 // ---------------------------------------------------------------------------
++ (void)appendType:(NSString*)ident toArray:(NSMutableArray<UTType*>*)arr {
+  UTType* t = [UTType typeWithIdentifier:ident];
+  if (t) [arr addObject:t];
+}
+
 - (void)addRootfsTapped:(UIButton*)sender {
   (void)sender;
   if (_importing) return;
+  NSMutableArray<UTType*>* types = [NSMutableArray array];
+  [AOTDroidViewController appendType:@"public.zip-archive" toArray:types];
+  [AOTDroidViewController appendType:@"public.disk-image" toArray:types];
   UIDocumentPickerViewController* picker;
   if (@available(iOS 14.0, *)) {
-    // NOTE: ObjC selector is initForOpeningContentTypes: (Swift adds the With)
     picker = [[UIDocumentPickerViewController alloc]
-        initForOpeningContentTypes:@[[UTType typeWithIdentifier:@"public.data"]]];
+        initForOpeningContentTypes:types asCopy:YES];
   } else {
     picker = [[UIDocumentPickerViewController alloc]
-        initWithDocumentTypes:@[@"public.data"] inMode:UIDocumentPickerModeOpen];
+        initWithDocumentTypes:@[@"public.zip-archive", @"public.disk-image"]
+                      inMode:UIDocumentPickerModeImport];
   }
   picker.delegate = self;
-  picker.allowsMultipleSelection = NO;
+  picker.allowsMultipleSelection = YES;
   [self presentViewController:picker animated:YES completion:nil];
 }
 
@@ -278,31 +302,24 @@
     didPickDocumentsAtURLs:(NSArray<NSURL*>*)urls {
   (void)controller;
   if (urls.count == 0) return;
-  NSURL* url = urls.firstObject;
-  // open-in-place: hold the security scope for the whole background import
-  BOOL scoped = [url startAccessingSecurityScopedResource];
-  [self startImportFrom:url stopScope:scoped];
+  [self importFiles:urls];
 }
 
 - (void)documentPickerWasCancelled:(UIDocumentPickerViewController*)controller {
   (void)controller;
 }
 
-- (void)startImportFrom:(NSURL*)url stopScope:(BOOL)scoped {
-  NSString* src = url.path;
-  NSDictionary* fattrs = [[NSFileManager defaultManager]
-      attributesOfItemAtPath:src error:nil];
-  uint64_t srcBytes = [fattrs[NSFileSize] unsignedLongLongValue];
+- (void)importFiles:(NSArray<NSURL*>*)urls {
+  NSString* home = NSHomeDirectory();
+  NSString* tmpRoot = NSTemporaryDirectory();
   uint64_t freeBytes = 0;
   NSDictionary* fsAttrs = [[NSFileManager defaultManager]
-      attributesOfFileSystemForPath:NSHomeDirectory() error:nil];
+      attributesOfFileSystemForPath:home error:nil];
   if (fsAttrs) freeBytes = [fsAttrs[NSFileSystemFreeSize] unsignedLongLongValue];
   [self logLine:[NSString stringWithFormat:
-      @"[rootfs] importing %@ (%llu MB; %llu MB free)...",
-      url.lastPathComponent, srcBytes / 1048576, freeBytes / 1048576]];
-  if (freeBytes && srcBytes * 2 + (512ULL << 20) > freeBytes) {
-    [self logLine:@"[rootfs] WARNING: low free space; import may fail"];
-  }
+      @"[rootfs] importing %lu file%@ (%llu MB free)",
+      (unsigned long)urls.count, urls.count == 1 ? @"" : @"s",
+      freeBytes / 1048576]];
 
   _importing = YES;
   _progress.hidden = NO;
@@ -316,23 +333,67 @@
   __weak AOTDroidViewController* weakSelf = self;
   dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
   dispatch_async(q, ^{
-    std::string err;
-    bool ok = aotdroid::RootfsManager::get().importTo(
-        [src UTF8String], [NSHomeDirectory() UTF8String],
-        [weakSelf](const aotdroid::ImportProgress& p) {
-          dispatch_async(dispatch_get_main_queue(), ^{
-            AOTDroidViewController* s = weakSelf;
-            if (!s) return;
-            s->_progress.progress = p.fraction;
-            s->_progressLabel.text = [NSString stringWithFormat:
-                @"[%s] %.0f%%  (%llu / %llu MB)",
-                p.phase.c_str(), p.fraction * 100.0,
-                (unsigned long long)(p.bytesDone / 1048576),
-                (unsigned long long)(p.bytesTotal / 1048576)];
-          });
-        }, &err);
-    // release the provider's file (and drop any tmp copy the picker made)
-    if (scoped) [url stopAccessingSecurityScopedResource];
+    NSUInteger okCount = 0;
+    for (NSUInteger i = 0; i < urls.count; ++i) {
+      NSURL* url = urls[i];
+      NSString* src = url.path;
+      // no-op under asCopy (the copy already lives in our sandbox); only
+      // matters for the iOS<14 import-mode fallback
+      BOOL scoped = [url startAccessingSecurityScopedResource];
+      uint64_t srcBytes = 0;
+      NSDictionary* fa = [[NSFileManager defaultManager]
+          attributesOfItemAtPath:src error:nil];
+      if (fa) srcBytes = [fa[NSFileSize] unsignedLongLongValue];
+      [weakSelf logLine:[NSString stringWithFormat:
+          @"[rootfs] %lu/%lu %@ (%llu MB)",
+          (unsigned long)(i + 1), (unsigned long)urls.count,
+          url.lastPathComponent, srcBytes / 1048576]];
+      if (freeBytes && srcBytes + (512ULL << 20) > freeBytes) {
+        [weakSelf logLine:@"[rootfs] WARNING: low free space; import may fail"];
+      }
+      std::string err;
+      bool ok = aotdroid::RootfsManager::get().importTo(
+          [src UTF8String], [home UTF8String],
+          [weakSelf, i, urls](const aotdroid::ImportProgress& p) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+              AOTDroidViewController* s = weakSelf;
+              if (!s) return;
+              s->_progress.progress =
+                  ((float)i + p.fraction) / (float)urls.count;
+              s->_progressLabel.text = [NSString stringWithFormat:
+                  @"[%s] %.0f%%  (%llu / %llu MB)",
+                  p.phase.c_str(), p.fraction * 100.0,
+                  (unsigned long long)(p.bytesDone / 1048576),
+                  (unsigned long long)(p.bytesTotal / 1048576)];
+            });
+          }, &err);
+      if (scoped) [url stopAccessingSecurityScopedResource];
+      // Reclaim the picker's tmp/ copy right away (asCopy mode). Only ever
+      // touch paths inside our own NSTemporaryDirectory().
+      if ([src hasPrefix:tmpRoot])
+        [[NSFileManager defaultManager] removeItemAtPath:src error:nil];
+      if (ok) {
+        ++okCount;
+        aotdroid::RootfsStatus st =
+            aotdroid::RootfsManager::get().status([home UTF8String]);
+        [weakSelf logLine:[NSString stringWithFormat:
+            @"[rootfs] -> installed %@ (Android %@, API %d): %u files, %llu MB",
+            [NSString stringWithUTF8String:st.profileTag.c_str()],
+            [NSString stringWithUTF8String:st.androidVersion.c_str()],
+            st.apiLevel, st.fileCount,
+            (unsigned long long)(st.packBytes / 1048576)]];
+      } else {
+        [weakSelf logLine:[NSString stringWithFormat:
+            @"[rootfs] -> FAILED: %s", err.c_str()]];
+      }
+    }
+    // summary: list every installed pack for the boot selector
+    NSMutableArray<NSString*>* tags = [NSMutableArray array];
+    for (NSString* n in [[NSFileManager defaultManager]
+            contentsOfDirectoryAtPath:home error:nil]) {
+      if ([n hasPrefix:@"rootfs-"] && [n hasSuffix:@".aotpack"] && n.length > 15)
+        [tags addObject:[n substringWithRange:NSMakeRange(7, n.length - 15)]];
+    }
     dispatch_async(dispatch_get_main_queue(), ^{
       AOTDroidViewController* s = weakSelf;
       if (!s) return;
@@ -340,19 +401,10 @@
       s->_progress.hidden = YES;
       s->_progressLabel.hidden = YES;
       s->_addBtn.enabled = YES;
-      if (ok) {
-        aotdroid::RootfsStatus st = aotdroid::RootfsManager::get().status(
-            [NSHomeDirectory() UTF8String]);
-        [s logLine:[NSString stringWithFormat:
-            @"[rootfs] installed %@ (Android %@, API %d): %u files, %llu MB pack",
-            [NSString stringWithUTF8String:st.profileTag.c_str()],
-            [NSString stringWithUTF8String:st.androidVersion.c_str()],
-            st.apiLevel, st.fileCount,
-            (unsigned long long)(st.packBytes / 1048576)]];
-      } else {
-        [s logLine:[NSString stringWithFormat:@"[rootfs] FAILED: %s",
-            err.c_str()]];
-      }
+      [s logLine:[NSString stringWithFormat:
+          @"[rootfs] batch done: %lu/%lu ok; packs installed: %@",
+          (unsigned long)okCount, (unsigned long)urls.count,
+          tags.count ? [tags componentsJoinedByString:@", "] : @"none"]];
       [s refreshRootfsCard];
     });
   });
