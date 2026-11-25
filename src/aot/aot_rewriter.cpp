@@ -498,9 +498,13 @@ bool AotRewriter::rewriteBuffer(const uint8_t* in, size_t inLen,
       ms.sectName = sname;
       ms.align = std::max<uint32_t>(2, (uint32_t)std::countr_zero((uint64_t)std::max<uint64_t>(1, s.sh_addralign)));
       ms.vaddr = s.sh_addr + (uint64_t)sg->vdelta;
-      if (s.sh_type == kSHT_NOBITS) { ms.zerofill = true; ms.zsize = s.sh_size; }
-      else ms.data.assign(in + s.sh_offset, in + s.sh_offset + s.sh_size);
-      ms.flags = exec ? macho::kSectProgBitsExec : macho::kSectRegular;
+      if (s.sh_type == kSHT_NOBITS) {
+        ms.zerofill = true; ms.zsize = s.sh_size;
+        ms.flags = macho::kSectZerofill;   // S_ZEROFILL: size only, no file bytes
+      } else {
+        ms.data.assign(in + s.sh_offset, in + s.sh_offset + s.sh_size);
+        ms.flags = exec ? macho::kSectProgBitsExec : macho::kSectRegular;
+      }
       if (s.sh_type == kSHT_INIT_ARRAY || s.sh_type == kSHT_FINI_ARRAY)
         ms.flags = macho::kSectInitFuncPtrs;
       os.sections.push_back(std::move(ms));

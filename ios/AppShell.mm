@@ -141,3 +141,14 @@
 }
 
 @end
+
+// ============================================================================
+//  Entry point: the app links from plain object files (no @main synthesis),
+//  so the UIKit bootstrap is explicit.
+// ============================================================================
+int main(int argc, char* argv[]) {
+  @autoreleasepool {
+    return UIApplicationMain(argc, argv, nil,
+                             NSStringFromClass([AOTDroidAppDelegate class]));
+  }
+}

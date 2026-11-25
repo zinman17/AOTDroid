@@ -303,16 +303,39 @@ static void test_rewrite_16k_and_veneers() {
   assert(mh.magic == kMH_MAGIC_64);
   assert(mh.filetype == kMH_OBJECT);
   assert(mh.cputype == kMachCpuTypeArm64);
-  // section headers parse and include __aotpatch / __aotgot / __aotmeta
+  assert(mh.sizeofcmds % 8 == 0);
+  // walk load commands: sections must live inside LC_SEGMENT_64s (ld64
+  // rejects bare section structs and unaligned cmdsize)
   Section64 sects[24];
-  assert(mh.sizeofcmds / sizeof(Section64) <= 24);
   uint32_t nSect = 0;
-  while (nSect * sizeof(Section64) + sizeof(mh) <= mh.sizeofcmds + sizeof(mh)) {
-    memcpy(&sects[nSect], mo.data() + sizeof(mh) + nSect * sizeof(Section64),
-           sizeof(Section64));
-    nSect++;
-    if (nSect >= 24) break;
+  bool sawSymtab = false;
+  {
+    uint64_t off = sizeof(MachHeader64);
+    for (uint32_t c = 0; c < mh.ncmds; ++c) {
+      uint32_t cmd = 0, cmdsize = 0;
+      memcpy(&cmd, mo.data() + off, 4);
+      memcpy(&cmdsize, mo.data() + off + 4, 4);
+      assert(cmdsize >= 8 && (cmdsize % 8) == 0);
+      if (cmd == kLC_SEGMENT_64) {
+        SegmentCommand64 sg;
+        memcpy(&sg, mo.data() + off, sizeof(sg));
+        assert(sg.nsects <= 24);
+        for (uint32_t k = 0; k < sg.nsects && nSect < 24; ++k) {
+          memcpy(&sects[nSect],
+                 mo.data() + off + sizeof(SegmentCommand64) + k * sizeof(Section64),
+                 sizeof(Section64));
+          assert(strncmp(sects[nSect].segname, sg.segname, 16) == 0);
+          nSect++;
+        }
+      } else if (cmd == kLC_SYMTAB) {
+        sawSymtab = true;
+      }
+      off += cmdsize;
+    }
+    assert(off == sizeof(MachHeader64) + mh.sizeofcmds);
   }
+  assert(sawSymtab);
+  assert(nSect >= 3);
   bool hasPatch = false, hasGot = false, hasMeta = false;
   for (uint32_t i = 0; i < nSect; ++i) {
     if (strcmp(sects[i].sectname, "__aotpatch") == 0) hasPatch = true;

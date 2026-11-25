@@ -258,6 +258,7 @@ constexpr const char* kSymSetAndroidTls = "aotdroid_set_android_tls_c";
 // ===========================================================================
 constexpr uint32_t kMH_MAGIC_64     = 0xfeedfacf;
 constexpr uint32_t kMH_OBJECT       = 1;            // Mach-O filetype MH_OBJECT
+constexpr uint32_t kLC_SEGMENT_64   = 0x19;         // LC_SEGMENT_64
 constexpr uint32_t kLC_SYMTAB       = 0x2;
 
 // arm64 Mach-O relocation types (mach-o/arm64/reloc.h).
@@ -275,10 +276,19 @@ struct MachHeader64 {
   uint32_t magic, cputype, cpusubtype, filetype, ncmds, sizeofcmds, flags, reserved;
 };
 struct SymtabCmd { uint32_t cmd, cmdsize, symoff, nsyms, stroff, strsize; };
+struct SegmentCommand64 {
+  uint32_t cmd, cmdsize;
+  char segname[16];
+  uint64_t vmaddr, vmsize, fileoff, filesize;
+  uint32_t maxprot, initprot, nsects, flags;
+};
 struct Section64 {
   char sectname[16], segname[16];
-  uint64_t addr, size, offset, align, reloff;
-  uint32_t nreloc, flags, reserved1, reserved2, reserved3;
+  uint64_t addr, size;
+  // canonical mach-o/loader.h layout: offset..reserved3 are all uint32_t,
+  // giving exactly 80 bytes -- any wider field makes ld64 reject the load
+  // command ("unaligned size").
+  uint32_t offset, align, reloff, nreloc, flags, reserved1, reserved2, reserved3;
 };
 struct MachReloc {
   uint32_t r_address;
@@ -288,6 +298,15 @@ struct MachNList64 {
   uint32_t n_strx; uint8_t n_type, n_sect; uint16_t n_desc; uint64_t n_value;
 };
 #pragma pack(pop)
+
+// ld64 hard-rejects objects whose load-command structures deviate from the
+// canonical sizes; lock them in at compile time.
+static_assert(sizeof(MachHeader64) == 32, "Mach-O 64 header must be 32 bytes");
+static_assert(sizeof(SegmentCommand64) == 72, "LC_SEGMENT_64 must be 72 bytes");
+static_assert(sizeof(Section64) == 80, "section_64 must be 80 bytes");
+static_assert(sizeof(SymtabCmd) == 24, "LC_SYMTAB must be 24 bytes");
+static_assert(sizeof(MachNList64) == 16, "nlist_64 must be 16 bytes");
+static_assert(sizeof(MachReloc) == 8, "relocation_info must be 8 bytes");
 
 constexpr uint32_t kMachCpuTypeArm64 = 0x0100000C;
 constexpr uint32_t kMachCpuSubtypeArm64All = 0;
