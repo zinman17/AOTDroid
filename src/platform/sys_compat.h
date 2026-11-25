@@ -40,7 +40,30 @@
   #include <sys/ioctl.h>
   #include <sys/stat.h>
   #include <sys/event.h>      // kqueue / kevent  (epoll + eventfd emulation)
-  #include <sys/ulock.h>     // __ulock_wait/__ulock_wake (futex emulation)
+  #if defined(__has_include)
+    #if __has_include(<sys/ulock.h>)
+      #include <sys/ulock.h>  // __ulock_wait/__ulock_wake (futex emulation)
+    #endif
+  #endif
+  #ifndef __ULOCK_DECLARED
+    // Newer Xcode SDKs no longer ship <sys/ulock.h>, but the ulock entry
+    // points are a stable C ABI in libSystem -- declare them ourselves.
+    #define __ULOCK_DECLARED 1
+    extern "C" {
+    int __ulock_wait(uint32_t operation, void* addr, uint64_t value,
+                     uint32_t timeout);
+    int __ulock_wake(uint32_t operation, void* addr, uint64_t wake_value);
+    }
+    #ifndef UL_COMPARE_AND_WAIT
+      #define UL_COMPARE_AND_WAIT      1
+    #endif
+    #ifndef UL_COMPARE_AND_WAIT64
+      #define UL_COMPARE_AND_WAIT64    5
+    #endif
+    #ifndef ULF_WAKE_ALL
+      #define ULF_WAKE_ALL             0x0100
+    #endif
+  #endif
   #include <unistd.h>
   #include <fcntl.h>
   #include <pthread.h>
