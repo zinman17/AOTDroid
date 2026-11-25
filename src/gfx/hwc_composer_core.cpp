@@ -207,15 +207,16 @@ int HwcComposerCore::grallocRelease(NativeHandle* h) {
 void HwcComposerCore::vsyncTick() { frames_.fetch_add(1); }
 
 // Host-build fallbacks for the Darwin gralloc entry points (the real
-// implementations live in hwc_metal_bridge.mm).
-#ifndef AOTDROID_APPLE
-void* grallocDarwinAlloc(uint32_t, uint32_t, int, uint64_t, uint32_t* stride) {
-  *stride = 0;
+// implementations live in hwc_metal_bridge.mm, which is only linked into the
+// device app). They are WEAK so the .mm's strong definitions win in the full
+// build while host builds (macOS CI, no UIKit/Metal) still link.
+__attribute__((weak)) void* grallocDarwinAlloc(uint32_t, uint32_t, int, uint64_t,
+                                               uint32_t* stride) {
+  if (stride) *stride = 0;
   return nullptr;
 }
-void* grallocDarwinLock(NativeHandle*) { return nullptr; }
-void grallocDarwinUnlock(NativeHandle*) {}
-void grallocDarwinFree(NativeHandle*) {}
-#endif
+__attribute__((weak)) void* grallocDarwinLock(NativeHandle*) { return nullptr; }
+__attribute__((weak)) void grallocDarwinUnlock(NativeHandle*) {}
+__attribute__((weak)) void grallocDarwinFree(NativeHandle*) {}
 
 }  // namespace aotdroid

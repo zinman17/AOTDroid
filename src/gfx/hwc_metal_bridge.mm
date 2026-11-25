@@ -1,15 +1,21 @@
 // ============================================================================
 //  AOTDroid-Adaptive-iOS  |  src/gfx/hwc_metal_bridge.mm   (MODULE 5)
-//  IOSurface-backed gralloc + zero-copy Metal presentation onto CAMetalLayer,
-//  CADisplayLink-driven vsync, UIResponder touch injection into EventHub, and
-//  the ANGLE (GLES -> Metal) loader with tier-aware texture-cache throttling.
+//  CoreVideo-backed gralloc (IOSurface-backed CVPixelBuffers) + zero-copy
+//  Metal presentation onto CAMetalLayer via CVMetalTextureCache, CADisplayLink
+//  vsync, UIResponder touch injection into EventHub, and the ANGLE
+//  (GLES -> Metal) loader with tier-aware texture-cache throttling.
+//
+//  NOTE: <IOSurface/IOSurface.h> and Metal's -newTextureWithDescriptor:
+//  iosurface:plane: are NOT public on the iPhoneOS SDK; the public iOS path
+//  to the same IOSurface-backed zero-copy buffers is CoreVideo:
+//  CVPixelBuffer (kCVPixelBufferIOSurfacePropertiesKey) + CVMetalTextureCache.
 // ============================================================================
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <Metal/Metal.h>
 #import <MetalKit/MetalKit.h>
-#import <IOSurface/IOSurface.h>
 #import <CoreVideo/CVPixelBuffer.h>
+#import <CoreVideo/CVMetalTexture.h>
 #import <QuartzCore/QuartzCore.h>
 #import <dlfcn.h>
 #include "hwc_metal_bridge.h"
@@ -18,11 +24,10 @@
 namespace aotdroid {
 
 // ===========================================================================
-// gralloc: IOSurface allocation + CPU lock via CVPixelBuffer
+// gralloc: IOSurface-backed allocation via CVPixelBuffer + CPU lock
 // ===========================================================================
 namespace {
 struct GrallocBuffer {
-  IOSurfaceRef surface = nil;
   CVPixelBufferRef pixelBuffer = nil;
   uint32_t width = 0, height = 0, stride = 0;
   int format = 0;
@@ -32,13 +37,25 @@ struct GrallocBuffer {
 OSType toCVPixelFormat(int halFormat) {
   switch (halFormat) {
     case kHAL_PIXEL_FORMAT_RGBA_8888: return kCVPixelFormatType_32RGBA;
-    case kHAL_PIXEL_FORMAT_RGBX_8888: return kCVPixelFormatType_32RGBX;
+    // 32RGBX has no public Metal mapping; RGBA is visually identical (alpha
+    // is ignored for display) and keeps the zero-copy texture path valid.
+    case kHAL_PIXEL_FORMAT_RGBX_8888: return kCVPixelFormatType_32RGBA;
     case kHAL_PIXEL_FORMAT_BGRA_8888: return kCVPixelFormatType_32BGRA;
     default: return kCVPixelFormatType_32BGRA;
   }
 }
 
-// iosurfaceId -> live buffer registry
+MTLPixelFormat toMTLPixelFormat(OSType cvf) {
+  switch (cvf) {
+    case kCVPixelFormatType_32RGBA: return MTLPixelFormatRGBA8Unorm;
+    case kCVPixelFormatType_32BGRA: return MTLPixelFormatBGRA8Unorm;
+    default: return MTLPixelFormatBGRA8Unorm;
+  }
+}
+
+std::atomic<uint32_t> g_nextSurfaceId{1};   // our own buffer registry id
+
+// surfaceId -> live buffer registry
 std::unordered_map<uint32_t, GrallocBuffer*>& byId() {
   static std::unordered_map<uint32_t, GrallocBuffer*> m;
   return m;
@@ -53,14 +70,11 @@ void* grallocDarwinAlloc(uint32_t w, uint32_t h, int format, uint64_t usage,
   if (CVPixelBufferCreate(nil, w, h, cvf,
                           (__bridge CFDictionaryRef)attrs, &pb) != kCVReturnSuccess)
     return nullptr;
-  CVPixelBufferRetain(pb);
-  IOSurfaceRef surf = CVPixelBufferGetIOSurface(pb);
-  if (!surf) { CVPixelBufferRelease(pb); return nullptr; }
+  // CVPixelBufferCreate returns a buffer with +1 retain; the registry owns it.
   auto* b = new GrallocBuffer();
-  b->surface = surf;
   b->pixelBuffer = pb;
   b->width = w; b->height = h;
-  b->stride = (uint32_t)(IOSurfaceGetBytesPerRow(surf) / 4);
+  b->stride = (uint32_t)(CVPixelBufferGetBytesPerRow(pb) / 4);
   b->format = format;
   b->usage = usage;
   if (stride) *stride = b->stride;
@@ -72,7 +86,7 @@ void* grallocDarwinAlloc(uint32_t w, uint32_t h, int format, uint64_t usage,
   nh->stride = b->stride;
   nh->format = format;
   nh->usage = usage;
-  nh->iosurfaceId = IOSurfaceGetID(surf);
+  nh->iosurfaceId = g_nextSurfaceId.fetch_add(1);
   byId()[nh->iosurfaceId] = b;
   return nh;
 }
@@ -108,41 +122,42 @@ id<MTLDevice> g_device = nil;
 id<MTLCommandQueue> g_queue = nil;
 CAMetalLayer* g_layer = nil;
 CADisplayLink* g_displayLink = nil;
+CVMetalTextureCacheRef g_cvTexCache = nil;
 // texture cache with tier-aware byte budget (LRU eviction)
-struct CacheEnt { id<MTLTexture> tex; uint64_t lastUse; size_t bytes; };
+struct CacheEnt { id<MTLTexture> tex; CVMetalTextureRef cvTex; uint64_t lastUse; size_t bytes; };
 std::unordered_map<uint32_t, CacheEnt> g_texCache;
 uint64_t g_cacheBudget = 96 * 1024 * 1024;   // 96 MB default (Tier 1)
 uint64_t g_cacheUsed = 0;
 uint64_t g_frame = 0;
 
-id<MTLTexture> textureForSurface(IOSurfaceRef surf) {
-  uint32_t key = IOSurfaceGetID(surf);
+id<MTLTexture> textureForBuffer(CVPixelBufferRef pb, uint32_t key) {
   auto it = g_texCache.find(key);
   if (it != g_texCache.end()) {
     it->second.lastUse = g_frame;
     return it->second.tex;
   }
-  MTLTextureDescriptor* desc =
-      [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8
-                                                           width:IOSurfaceGetWidth(surf)
-                                                          height:IOSurfaceGetHeight(surf)
-                                                       mipmapped:NO];
-  desc.storageMode = MTLStorageModeShared;
-  desc.usage = MTLTextureUsageShaderRead;
-  id<MTLTexture> tex = [g_device newTextureWithDescriptor:desc
-                                                 iosurface:surf
-                                                     plane:0];
-  if (!tex) return nil;
-  size_t bytes = (size_t)IOSurfaceGetBytesPerRow(surf) * IOSurfaceGetHeight(surf);
+  if (!g_cvTexCache || !pb) return nil;
+  size_t w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb);
+  size_t rowBytes = CVPixelBufferGetBytesPerRow(pb);
+  CVMetalTextureRef cvTex = nil;
+  CVReturn cr = CVMetalTextureCacheCreateTextureFromImage(
+      kCFAllocatorDefault, g_cvTexCache, pb, nil,
+      toMTLPixelFormat(CVPixelBufferGetPixelFormatType(pb)),
+      (size_t)w, (size_t)h, 0, &cvTex);
+  if (cr != kCVReturnSuccess || !cvTex) return nil;
+  id<MTLTexture> tex = CVMetalTextureGetTexture(cvTex);
+  if (!tex) { CFRelease(cvTex); return nil; }
+  size_t bytes = rowBytes * h;
   // LRU eviction to stay inside the tier budget
   while (g_cacheUsed + bytes > g_cacheBudget && !g_texCache.empty()) {
     auto oldest = g_texCache.begin();
     for (auto it2 = g_texCache.begin(); it2 != g_texCache.end(); ++it2)
       if (it2->second.lastUse < oldest->second.lastUse) oldest = it2;
     g_cacheUsed -= oldest->second.bytes;
+    if (oldest->second.cvTex) CFRelease(oldest->second.cvTex);
     g_texCache.erase(oldest);
   }
-  g_texCache[key] = {tex, g_frame, bytes};
+  g_texCache[key] = {tex, cvTex, g_frame, bytes};
   g_cacheUsed += bytes;
   return tex;
 }
@@ -209,7 +224,8 @@ void presentRequest(const PresentRequest& req) {
   for (const auto& l : req.layers) {
     auto it = byId().find(l.handle ? l.handle->iosurfaceId : 0);
     if (it == byId().end()) continue;
-    id<MTLTexture> tex = textureForSurface(it->second->surface);
+    id<MTLTexture> tex = textureForBuffer(it->second->pixelBuffer,
+                                          l.handle->iosurfaceId);
     if (!tex) continue;
     // blit-based layer placement (full pipeline shaders live in the ANGLE path)
     id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
@@ -243,10 +259,17 @@ void* hwcMetalAttachToView(void* uivc, uint32_t fbW, uint32_t fbH,
   g_layer.device = g_device;
   g_layer.pixelFormat = MTLPixelFormatBGRA8;
   g_layer.drawableSize = CGSizeMake(fbW, fbH);
-  g_layer.framebufferOnly = NO;   // gralloc IOSurfaces are shared CPU/GPU
+  g_layer.framebufferOnly = NO;   // gralloc buffers are shared CPU/GPU
   [vc.view addSubview:view];
   g_cacheBudget = textureCacheBudgetBytes ? textureCacheBudgetBytes
                                           : 96 * 1024 * 1024;
+  // zero-copy texture path: CoreVideo Metal texture cache over the
+  // IOSurface-backed pixel buffers (public API on iOS)
+  if (CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, g_device, nil,
+                                &g_cvTexCache) != kCVReturnSuccess) {
+    g_cvTexCache = nil;
+    AOTD_LOGW("hwc", "CVMetalTextureCacheCreate failed; presentation disabled");
+  }
   HwcComposerCore::get().setPresentSink(&presentRequest);
   InputHub::get(0).setScreenSize((int)fbW, (int)fbH);
 

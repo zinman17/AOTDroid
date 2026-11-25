@@ -68,12 +68,11 @@ if(NOT AOTDROID_HOST)
   find_library(METAL Metal REQUIRED)
   find_library(METALKIT MetalKit REQUIRED)
   find_library(QUARTZCORE QuartzCore REQUIRED)
-  find_library(IOSURFACE IOSurface REQUIRED)
   find_library(COREVIDEO CoreVideo REQUIRED)
   find_library(DISPATCH dispatch REQUIRED)
   target_link_libraries(aotdroid_core PUBLIC
     ${FOUNDATION} ${UIKIT} ${METAL} ${METALKIT} ${QUARTZCORE}
-    ${IOSURFACE} ${COREVIDEO} ${DISPATCH})
+    ${COREVIDEO} ${DISPATCH})
   set_target_properties(aotdroid_core PROPERTIES
     OBJCXX_ARC ON
     XCODE_ATTRIBUTE_IPHONEOS_DEPLOYMENT_TARGET "15.0")
@@ -123,8 +122,7 @@ if(NOT AOTDROID_HOST AND CMAKE_SYSTEM_NAME STREQUAL "iOS")
   find_library(F_METAL Metal REQUIRED)
   find_library(F_METALKIT MetalKit REQUIRED)
   find_library(F_QUARTZ QuartzCore REQUIRED)
-  find_library(F_IOSURF IOSurface REQUIRED)
   find_library(F_COREVIDEO CoreVideo REQUIRED)
   target_link_libraries(AOTDroid PRIVATE ${F_UIKIT} ${F_METAL} ${F_METALKIT}
-                       ${F_QUARTZ} ${F_IOSURF} ${F_COREVIDEO})
+                       ${F_QUARTZ} ${F_COREVIDEO})
 endif()
