@@ -262,8 +262,9 @@
   if (_importing) return;
   UIDocumentPickerViewController* picker;
   if (@available(iOS 14.0, *)) {
+    // NOTE: ObjC selector is initForOpeningContentTypes: (Swift adds the With)
     picker = [[UIDocumentPickerViewController alloc]
-        initWithForOpeningContentTypes:@[[UTType typeWithIdentifier:@"public.data"]]];
+        initForOpeningContentTypes:@[[UTType typeWithIdentifier:@"public.data"]]];
   } else {
     picker = [[UIDocumentPickerViewController alloc]
         initWithDocumentTypes:@[@"public.data"] inMode:UIDocumentPickerModeOpen];
