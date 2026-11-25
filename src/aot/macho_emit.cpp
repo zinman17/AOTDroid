@@ -23,18 +23,28 @@ bool emit_object(const ObjectSpec& spec, std::vector<uint8_t>* out,
 
   const size_t headerSize = sizeof(MachHeader64) + sizeof(SegmentCommand64)
                             + nSect * sizeof(Section64) + sizeof(SymtabCmd);
-  // ---- assign file offsets to section data (spec order) ----
-  struct SecInfo { uint64_t fileOff = 0; bool hasFile = false; uint64_t relocOff = 0; };
+  // ---- assign file offsets AND sequential virtual addresses ----
+  // ld64 rejects objects whose section virtual ranges overlap (all-zero
+  // addrs from the spec would collide); assign packed, aligned addrs like a
+  // linker would. Spec vaddrs are ignored: MH_OBJECT addresses are only a
+  // preferred layout, and the runtime locates sections by NAME.
+  struct SecInfo { uint64_t fileOff = 0; bool hasFile = false; uint64_t relocOff = 0;
+                   uint64_t addr = 0; };
   std::vector<SecInfo> si(nSect);
   uint64_t cursor = headerSize;
+  uint64_t va = 0;
   for (size_t i = 0; i < nSect; ++i) {
     const SectionSpec& s = spec.sections[i];
     uint32_t align = std::max<uint32_t>(s.align, 2);
     cursor = (cursor + ((1ull << align) - 1)) & ~((1ull << align) - 1);
-    if (s.zerofill) continue;                 // no file bytes
+    va = (va + ((1ull << align) - 1)) & ~((1ull << align) - 1);
+    si[i].addr = va;
+    if (s.zerofill) { va += s.zsize; continue; }   // no file bytes
     si[i].fileOff = cursor; si[i].hasFile = true;
     cursor += s.data.size();
+    va += s.data.size();
   }
+  const uint64_t totalVsize = va;
   // ---- relocations per section ----
   uint64_t relocCursor = (cursor + 7) & ~7ull;
   for (size_t i = 0; i < nSect; ++i) si[i].relocOff = relocCursor;
@@ -86,10 +96,7 @@ bool emit_object(const ObjectSpec& spec, std::vector<uint8_t>* out,
     memset(sg.segname, 0, 16);
     strcpy(sg.segname, "__TEXT");
     sg.vmaddr = 0;
-    uint64_t vmsz = 0;
-    for (const SectionSpec& s : spec.sections)
-      vmsz += s.zerofill ? s.zsize : s.data.size();
-    sg.vmsize = vmsz;
+    sg.vmsize = totalVsize;   // packed, non-overlapping section addrs
     sg.fileoff = 0;
     sg.filesize = totalSize;   // whole object rides in the segment
     sg.maxprot = 7;            // RWX (object file; final link decides)
@@ -106,7 +113,7 @@ bool emit_object(const ObjectSpec& spec, std::vector<uint8_t>* out,
     memset(sc.sectname, 0, 16); memset(sc.segname, 0, 16);
     strncpy(sc.sectname, s.sectName.c_str(), 15);
     strncpy(sc.segname, s.segName.empty() ? "__TEXT" : s.segName.c_str(), 15);
-    sc.addr = s.vaddr;
+    sc.addr = si[i].addr;
     sc.size = s.zerofill ? s.zsize : s.data.size();
     sc.offset = (uint32_t)(si[i].hasFile ? si[i].fileOff : 0);
     sc.align = std::max<uint32_t>(s.align, 2);
@@ -202,7 +209,10 @@ bool emit_object(const ObjectSpec& spec, std::vector<uint8_t>* out,
                                                        : kNTypeSect);
       n.n_sect = (uint8_t)s.sectIdx;
       n.n_desc = 0;
-      n.n_value = s.value;
+      // symbols carry section-relative offsets in the spec; n_value must be
+      // the (assigned) address: section addr + offset
+      n.n_value = (s.sectIdx && s.sectIdx <= nSect ? si[s.sectIdx - 1].addr : 0)
+                  + s.value;
       put(&n, sizeof(n), symOff + i * sizeof(MachNList64));
     }
     base[strOff] = 0; base[strOff + 1] = 0;  // safety pair ("" entry)

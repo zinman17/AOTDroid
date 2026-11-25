@@ -24,7 +24,8 @@ struct SectionSpec {
   std::string segName;    // "__TEXT", "__DATA", "__AOTDATA"
   std::string sectName;   // "__text", "__data", "__aotgot", "__aotmeta" ...
   std::vector<uint8_t> data;
-  uint64_t vaddr = 0;     // preferred address (informational in MH_OBJECT)
+  uint64_t vaddr = 0;     // ignored: the emitter assigns packed, aligned,
+                          // non-overlapping addresses (ld64 requirement)
   uint32_t align = 3;     // 2^align
   uint32_t flags = 0;     // Mach-O section type/attrs
   bool zerofill = false;  // S_ZEROFILL: size only, no file bytes
