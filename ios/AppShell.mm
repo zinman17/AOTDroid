@@ -262,7 +262,7 @@
   if (_importing) return;
   UIDocumentPickerViewController* picker =
       [[UIDocumentPickerViewController alloc]
-          initWithForOpeningContentTypes:@[UTType.data]
+          initWithForOpeningContentTypes:@[[UTType typeWithIdentifier:@"public.data"]]
                            asCopy:YES];   // picker copies into our tmp; no scope dance
   picker.delegate = self;
   picker.allowsMultipleSelection = NO;
@@ -282,12 +282,12 @@
 
 - (void)startImportFrom:(NSURL*)url {
   NSString* src = url.path;
-  uint64_t srcBytes = [[[NSFileManager defaultManager]
-      attributesOfItemAtPath:src error:nil] fileSize].unsignedLongLongValue;
+  NSDictionary* fattrs = [[NSFileManager defaultManager]
+      attributesOfItemAtPath:src error:nil];
+  uint64_t srcBytes = [fattrs[NSFileSize] unsignedLongLongValue];
   uint64_t freeBytes = 0;
-  NSError* fsErr = nil;
   NSDictionary* fsAttrs = [[NSFileManager defaultManager]
-      attributesOfFileSystemForPath:NSHomeDirectory() error:&fsErr];
+      attributesOfFileSystemForPath:NSHomeDirectory() error:nil];
   if (fsAttrs) freeBytes = [fsAttrs[NSFileSystemFreeSize] unsignedLongLongValue];
   [self logLine:[NSString stringWithFormat:
       @"[rootfs] importing %@ (%llu MB; %llu MB free)...",
@@ -305,18 +305,18 @@
   _bootBtn.enabled = NO;
   _removeBtn.enabled = NO;
 
+  __weak AOTDroidViewController* weakSelf = self;
   dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
   dispatch_async(q, ^{
     std::string err;
-    __weak typeof(self) weakSelf = self;
     bool ok = aotdroid::RootfsManager::get().importTo(
         [src UTF8String], [NSHomeDirectory() UTF8String],
         [weakSelf](const aotdroid::ImportProgress& p) {
           dispatch_async(dispatch_get_main_queue(), ^{
-            __strong typeof(self) self = weakSelf;
-            if (!self) return;
-            self->_progress.progress = p.fraction;
-            self->_progressLabel.text = [NSString stringWithFormat:
+            AOTDroidViewController* s = weakSelf;
+            if (!s) return;
+            s->_progress.progress = p.fraction;
+            s->_progressLabel.text = [NSString stringWithFormat:
                 @"[%s] %.0f%%  (%llu / %llu MB)",
                 p.phase.c_str(), p.fraction * 100.0,
                 (unsigned long long)(p.bytesDone / 1048576),
@@ -326,26 +326,26 @@
     // remove the picker's tmp copy
     [[NSFileManager defaultManager] removeItemAtPath:src error:nil];
     dispatch_async(dispatch_get_main_queue(), ^{
-      __strong typeof(self) self = weakSelf;
-      if (!self) return;
-      self->_importing = NO;
-      self->_progress.hidden = YES;
-      self->_progressLabel.hidden = YES;
-      self->_addBtn.enabled = YES;
+      AOTDroidViewController* s = weakSelf;
+      if (!s) return;
+      s->_importing = NO;
+      s->_progress.hidden = YES;
+      s->_progressLabel.hidden = YES;
+      s->_addBtn.enabled = YES;
       if (ok) {
         aotdroid::RootfsStatus st = aotdroid::RootfsManager::get().status(
             [NSHomeDirectory() UTF8String]);
-        [self logLine:[NSString stringWithFormat:
+        [s logLine:[NSString stringWithFormat:
             @"[rootfs] installed %@ (Android %@, API %d): %u files, %llu MB pack",
             [NSString stringWithUTF8String:st.profileTag.c_str()],
             [NSString stringWithUTF8String:st.androidVersion.c_str()],
             st.apiLevel, st.fileCount,
             (unsigned long long)(st.packBytes / 1048576)]];
       } else {
-        [self logLine:[NSString stringWithFormat:@"[rootfs] FAILED: %s",
+        [s logLine:[NSString stringWithFormat:@"[rootfs] FAILED: %s",
             err.c_str()]];
       }
-      [self refreshRootfsCard];
+      [s refreshRootfsCard];
     });
   });
 }
