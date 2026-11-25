@@ -6,11 +6,11 @@
 #    rewrite-fixture (ubuntu): assemble a real arm64 .so with the cross
 #                     assembler, run aotdroid-rewrite over it, verify the
 #                     patched bytes with python (site -> veneer chains)
-#    ios-build       (macos-14): compile EVERY source (incl. .mm) against the
+#    ios-build       (macos-latest): compile EVERY source (incl. .mm) against the
 #                     iPhoneOS SDK -> proof of zero syntax errors; package the
 #                     unsigned AOTDroid.app into AOTDroid-unsigned.ipa for
 #                     SideStore / AltStore (re-signed at install)
-#    macho-link-check(macos-14): feed the emitted Mach-O object to ld64
+#    macho-link-check(macos-latest): feed the emitted Mach-O object to ld64
 #    full-ipa        (manual): rootfs build + conversion + IPA with images
 # =============================================================================
 name: build-ipa
@@ -39,7 +39,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-14]
+        os: [ubuntu-24.04, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - name: Toolchain info
@@ -140,7 +140,7 @@ jobs:
   # ---------------------------------------------------------------------------
   ios-build:
     name: iOS build (zero-syntax-errors gate)
-    runs-on: macos-14
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - name: Select Xcode
@@ -210,7 +210,7 @@ jobs:
   # ---------------------------------------------------------------------------
   macho-link-check:
     name: ld64 accepts emitted Mach-O
-    runs-on: macos-14
+    runs-on: macos-latest
     needs: [host-tests]
     steps:
       - uses: actions/checkout@v4
@@ -231,7 +231,7 @@ jobs:
   # ---------------------------------------------------------------------------
   full-ipa:
     name: full IPA (rootfs images; manual)
-    runs-on: macos-14
+    runs-on: macos-latest
     if: github.event_name == 'workflow_dispatch' && inputs.profile != 'none'
     steps:
       - uses: actions/checkout@v4
