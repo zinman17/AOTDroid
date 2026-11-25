@@ -304,10 +304,12 @@ static void test_rewrite_16k_and_veneers() {
   assert(mh.filetype == kMH_OBJECT);
   assert(mh.cputype == kMachCpuTypeArm64);
   assert(mh.sizeofcmds % 8 == 0);
-  // walk load commands: sections must live inside LC_SEGMENT_64s (ld64
-  // rejects bare section structs and unaligned cmdsize)
+  // walk load commands: exactly ONE LC_SEGMENT_64 must wrap all sections
+  // (ld64 rejects multiple segments in a relocatable object) and every
+  // cmdsize must be 8-byte aligned
   Section64 sects[24];
   uint32_t nSect = 0;
+  uint32_t nSegCmds = 0;
   bool sawSymtab = false;
   {
     uint64_t off = sizeof(MachHeader64);
@@ -317,14 +319,16 @@ static void test_rewrite_16k_and_veneers() {
       memcpy(&cmdsize, mo.data() + off + 4, 4);
       assert(cmdsize >= 8 && (cmdsize % 8) == 0);
       if (cmd == kLC_SEGMENT_64) {
+        nSegCmds++;
         SegmentCommand64 sg;
         memcpy(&sg, mo.data() + off, sizeof(sg));
         assert(sg.nsects <= 24);
+        assert(cmdsize == sizeof(SegmentCommand64)
+                               + sg.nsects * sizeof(Section64));
         for (uint32_t k = 0; k < sg.nsects && nSect < 24; ++k) {
           memcpy(&sects[nSect],
                  mo.data() + off + sizeof(SegmentCommand64) + k * sizeof(Section64),
                  sizeof(Section64));
-          assert(strncmp(sects[nSect].segname, sg.segname, 16) == 0);
           nSect++;
         }
       } else if (cmd == kLC_SYMTAB) {
@@ -334,6 +338,7 @@ static void test_rewrite_16k_and_veneers() {
     }
     assert(off == sizeof(MachHeader64) + mh.sizeofcmds);
   }
+  assert(nSegCmds == 1);
   assert(sawSymtab);
   assert(nSect >= 3);
   bool hasPatch = false, hasGot = false, hasMeta = false;
