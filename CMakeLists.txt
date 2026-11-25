@@ -8,7 +8,10 @@
 #            -DCMAKE_OSX_SYSROOT=iphoneos -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0
 # ============================================================================
 cmake_minimum_required(VERSION 3.22)
-project(AOTDroid VERSION 0.1.0 LANGUAGES C CXX OBJCXX OBJC)
+# NOTE: do NOT declare OBJCXX/OBJC here -- Linux hosts (ubuntu runners) ship
+# g++ without cc1objplus and project(... OBJCXX) then hard-fails at configure
+# time. The Apple-only .mm sources are enabled conditionally below.
+project(AOTDroid VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -18,6 +21,12 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 option(AOTDROID_HOST "Build host tooling + tests (no UIKit/Metal)" OFF)
 option(AOTDROID_BUILD_TESTS "Build unit tests" ON)
 option(AOTDROID_WERROR "Treat warnings as errors" OFF)
+
+# ObjC++ is only required for the Apple (iOS/macOS) app build; host tooling
+# and tests are pure C++ and must configure on stock Linux g++/clang.
+if(NOT AOTDROID_HOST)
+  enable_language(OBJCXX)
+endif()
 
 if(AOTDROID_WERROR)
   add_compile_options(-Werror)

@@ -106,19 +106,30 @@ jobs:
           assert stats['tlsWrites'] == 1, stats
           assert stats['veneers'] + stats['brkTrampolines'] == 5, stats
           data = open('fixture/rewritten.elf','rb').read()
-          # ELF64 header sanity + phdr count (+1 = PT_AOTPATCH)
+          # phdr count must be original + 1 and the extra one is PT_AOTPATCH
+          # (0x70000001). The input count is linker-dependent (ubuntu ld emits
+          # an extra PT_NOTE for the build-id), so compare against the input
+          # ELF instead of a hard-coded constant.
+          orig = open('fixture/libfixture.so','rb').read()
+          o_phnum = struct.unpack_from('<H', orig, 0x38)[0]
           e_phnum = struct.unpack_from('<H', data, 0x38)[0]
-          assert e_phnum == 4, e_phnum
+          assert e_phnum == o_phnum + 1, (o_phnum, e_phnum)
           # every PT_LOAD must satisfy p_offset == p_vaddr (mod 16384)
           e_phoff, = struct.unpack_from('<Q', data, 0x20)
           loads = []
+          patch_seg = None
           for i in range(e_phnum):
               ph = data[e_phoff + i*56 : e_phoff + (i+1)*56]
               p_type, p_flags = struct.unpack_from('<II', ph, 0)
               p_off, p_va = struct.unpack_from('<QQ', ph, 8)
+              if p_type == 0x70000001:
+                  assert patch_seg is None, "duplicate PT_AOTPATCH"
+                  patch_seg = (p_off, p_va)
               if p_type == 1:
                   assert p_off % 16384 == p_va % 16384, (p_off, p_va)
                   loads.append((p_off, p_va, p_flags))
+          assert loads, "no PT_LOAD segments found"
+          assert patch_seg is not None, "PT_AOTPATCH segment missing"
           # no original svc #0 left anywhere in the exec segment
           execseg = loads[0]
           seg = data[execseg[0]:execseg[0]+0x2000]
