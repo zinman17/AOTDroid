@@ -98,19 +98,32 @@ struct PackHeader {
 struct PackEntry {
   uint32_t nameOff, mode, uid, gid;
   uint64_t blobOff, size;
-  uint32_t flags;   // bit0 = executable (16 KiB aligned), bit1 = directory
+  uint32_t flags;   // bit0 = exec (16 KiB aligned), bit1 = dir, bit2 = symlink
 };
-constexpr uint32_t kPackFlagExec = 1, kPackFlagDir = 2;
+constexpr uint32_t kPackFlagExec = 1, kPackFlagDir = 2, kPackFlagSymlink = 4;
 
 class PackVFS {
  public:
   bool open(const std::string& hostPath, std::string* err);
+  // Path lookup with symlink resolution (open semantics): a pack symlink is
+  // stored as its target string; following the chain rewrites the key.
   bool lookup(const std::string& linuxPath, PackEntry* out, const uint8_t** data) const;
+  // No-symlink-follow variant (readlink / lstat semantics).
+  bool lookupRaw(const std::string& linuxPath, PackEntry* out,
+                 const uint8_t** data) const;
   // list directory (returns entry names)
   std::vector<std::string> listDir(const std::string& linuxDir) const;
   const PackHeader& header() const { return hdr_; }
+  ~PackVFS();
+  void close();
  private:
-  std::vector<uint8_t> map_;        // pack bytes (read via file into memory)
+  bool lookupNormalized(std::string key, PackEntry* out, const uint8_t** data,
+                        bool followSymlinks) const;
+  // pack bytes served via mmap (multi-GB GSIs must not sit in heap)
+  uint8_t* mapBase_ = nullptr;
+  size_t mapLen_ = 0;
+  int fd_ = -1;
+  bool sorted_ = false;
   PackHeader hdr_{};
   const PackEntry* entries_ = nullptr;
   const char* strs_ = nullptr;

@@ -11,6 +11,8 @@
 #include "property_area.h"
 #include "domain.h"
 #include "../linker/syscall_bridge.h"
+#include "../rootfs/rootfs_manager.h"
+#include <sys/stat.h>
 
 namespace aotdroid {
 
@@ -52,26 +54,49 @@ BootResult containerBoot(const BootConfig& cfg) {
   paths().addMount("/apex", root + "/rootfs/apex");
   paths().addMount("/data", root + "/data");
 
-  // 2. rootfs pack (read-only, mmap-able)
+  // 2. rootfs pack (read-only, mmap-able). Prefer the pack matching the
+  //    selected profile; fall back to any installed pack ("Add RootFS" UI
+  //    writes rootfs-<tag>.aotpack + rootfs.json into the container).
   std::string packErr;
-  if (!rootfsPack().open(root + "/rootfs-" + cfg.profileTag + ".aotpack", &packErr)) {
-    r.ok = false;
-    r.error = "rootfs pack: " + packErr;
-    return r;
+  std::string actualTag;
+  uint32_t apiLevel = cfg.apiLevel;
+  std::string profileTag = cfg.profileTag ? cfg.profileTag : "";
+  std::string packPath = RootfsManager::resolvePackPath(root, profileTag, &actualTag);
+  if (packPath.empty()) {
+    // no pack: allow a hand-copied unpacked tree (Documents/rootfs/system)
+    struct stat st {};
+    bool haveTree = ::stat((root + "/rootfs/system").c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+    if (!haveTree) {
+      r.ok = false;
+      r.error = "no rootfs installed: tap 'Add RootFS' and pick a GSI .zip "
+                "(system.img inside, or an unpacked system/ tree)";
+      return r;
+    }
+  } else {
+    if (!rootfsPack().open(packPath, &packErr)) {
+      r.ok = false;
+      r.error = "rootfs pack: " + packErr;
+      return r;
+    }
+    // align the profile with what is actually installed
+    if (actualTag != profileTag) {
+      apiLevel = (uint32_t)RootfsManager::apiForTag(actualTag);
+      profileTag = actualTag;
+    }
   }
 
   // 3. binder domains + protocol version
-  BinderEmu::get().configure(cfg.apiLevel);
+  BinderEmu::get().configure(apiLevel);
   BinderEmu::get().initContexts();
 
   // 4. properties (flat for 7.1/8.1, trie for 10)
-  applyBootProperties(cfg.apiLevel, "arm64-v8a", cfg.deviceModel, "userdebug");
+  applyBootProperties(apiLevel, "arm64-v8a", cfg.deviceModel, "userdebug");
   for (auto& kv : cfg.extraProperties) PropertyStore::get().setDefault(kv.first, kv.second);
-  auto area = PropertyAreaBuilder::build(cfg.apiLevel, PropertyStore::get().all(),
+  auto area = PropertyAreaBuilder::build(apiLevel, PropertyStore::get().all(),
                                          "u:object_r:default_prop:s0");
   propFiles().clear();
   propFiles().push_back({"/dev/__properties__/properties_serialized", area.main});
-  if (cfg.apiLevel >= 29) {
+  if (apiLevel >= 29) {
     for (auto& c : area.contexts)
       propFiles().push_back({"/dev/__properties__/" + c.first, c.second});
   } else {

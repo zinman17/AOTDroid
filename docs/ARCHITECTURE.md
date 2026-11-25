@@ -88,6 +88,29 @@ Isolator** (`src/runtime/domain.*`) replaces the process abstraction:
  └───────────────────────────────────────────────────────┘   └──────────────────────────────────┘
 ```
 
+### 2.0 On-device GSI import (src/rootfs/)
+
+The launcher's **Add RootFS** flow replaces the offline-only pack story for
+end users: a GSI `.zip` picked via `UIDocumentPickerViewController` is
+converted entirely on-device by `RootfsManager` —
+
+```
+zip_reader (EOCD/ZIP64; stored = random-access pread, deflate = stream)
+   → sparse_image (Android sparse chunk map: raw / fill / dont-care)
+   → ext4_reader (extents depth 0..n, direct-block fallback, fast symlinks,
+                   64-bit BGD, metadata_csum images)
+   → pack_writer  (rootfs-<tag>.aotpack: sorted entries, mmap-served,
+                   16 KiB-aligned exec blobs, symlinks stored as targets)
+```
+
+Pack entry flags: bit0 = exec (16 KiB aligned), bit1 = dir,
+bit2 = symlink (blob holds the target string; `PackVFS::lookup` follows
+chains lexically, `readlinkat` is served from the raw entry). The profile
+tag comes from `ro.build.version.sdk` (≤25 → `android-7.1`, ≤28 →
+`android-8.1`, else `android-10`), and `containerBoot` aligns the boot
+profile with whatever pack is installed.
+
+
 ### 2.1 OAT version matrix
 
 | AOSP release | API | OAT header version | binder protocol | layout |

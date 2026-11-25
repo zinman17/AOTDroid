@@ -12,14 +12,19 @@ SRC="src/aot/macho_emit.cpp src/aot/aot_rewriter.cpp \
      src/runtime/vfs.cpp src/runtime/binder_emu.cpp src/runtime/property_area.cpp \
      src/runtime/domain.cpp src/runtime/container_boot.cpp \
      src/linker/syscall_bridge.cpp src/linker/bionic_linker.cpp \
-     src/gfx/input_hub.cpp src/gfx/hwc_composer_core.cpp"
+     src/gfx/input_hub.cpp src/gfx/hwc_composer_core.cpp \
+     src/rootfs/zip_reader.cpp src/rootfs/sparse_image.cpp \
+     src/rootfs/ext4_reader.cpp src/rootfs/pack_writer.cpp \
+     src/rootfs/rootfs_manager.cpp"
 mkdir -p build-host
 echo "== building aotdroid-rewrite =="
-g++ $FLAGS $SRC src/tools/aotdroid_rewrite_main.cpp -o build-host/aotdroid-rewrite -lpthread
+g++ $FLAGS $SRC src/tools/aotdroid_rewrite_main.cpp -o build-host/aotdroid-rewrite -lpthread -lz
+echo "== building aotdroid-import (GSI -> aotpack) =="
+g++ $FLAGS $SRC src/tools/import_main.cpp -o build-host/aotdroid-import -lpthread -lz
 echo "== building tests =="
-g++ $FLAGS $SRC tests/test_aot_rewriter.cpp      -o build-host/test_aot_rewriter     -lpthread
-g++ $FLAGS $SRC tests/test_property_trie.cpp     -o build-host/test_property_trie    -lpthread
-g++ $FLAGS $SRC tests/test_binder_loopback.cpp   -o build-host/test_binder_loopback  -lpthread
+g++ $FLAGS $SRC tests/test_aot_rewriter.cpp      -o build-host/test_aot_rewriter     -lpthread -lz
+g++ $FLAGS $SRC tests/test_property_trie.cpp     -o build-host/test_property_trie    -lpthread -lz
+g++ $FLAGS $SRC tests/test_binder_loopback.cpp   -o build-host/test_binder_loopback  -lpthread -lz
 echo "== running tests =="
 ./build-host/test_aot_rewriter
 ./build-host/test_property_trie

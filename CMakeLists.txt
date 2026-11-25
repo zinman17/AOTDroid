@@ -33,7 +33,8 @@ if(AOTDROID_WERROR)
 endif()
 
 # ---------------------------------------------------------------------------
-# Portable core (modules 2/3/4 + composer core + input hub + boot + linker)
+# Portable core (modules 2/3/4 + composer core + input hub + boot + linker
+# + rootfs import pipeline: zip/sparse/ext4/pack)
 # ---------------------------------------------------------------------------
 set(AOTDROID_CORE_SOURCES
   src/aot/macho_emit.cpp
@@ -47,7 +48,15 @@ set(AOTDROID_CORE_SOURCES
   src/linker/bionic_linker.cpp
   src/gfx/input_hub.cpp
   src/gfx/hwc_composer_core.cpp
+  src/rootfs/zip_reader.cpp
+  src/rootfs/sparse_image.cpp
+  src/rootfs/ext4_reader.cpp
+  src/rootfs/pack_writer.cpp
+  src/rootfs/rootfs_manager.cpp
 )
+
+# zlib: public on Linux hosts and in the iPhoneOS SDK (libz.tbd)
+find_library(AOTDROID_ZLIB z REQUIRED)
 
 if(NOT AOTDROID_HOST)
   # Darwin/iOS-only sources (modules 1/5/7 + app shell)
@@ -61,6 +70,7 @@ endif()
 
 add_library(aotdroid_core STATIC ${AOTDROID_CORE_SOURCES})
 target_include_directories(aotdroid_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(aotdroid_core PUBLIC ${AOTDROID_ZLIB})
 
 if(NOT AOTDROID_HOST)
   find_library(FOUNDATION Foundation REQUIRED)
@@ -70,19 +80,23 @@ if(NOT AOTDROID_HOST)
   find_library(QUARTZCORE QuartzCore REQUIRED)
   find_library(COREVIDEO CoreVideo REQUIRED)
   find_library(DISPATCH dispatch REQUIRED)
+  find_library(UNIFORMTYPEIDENTIFIERS UniformTypeIdentifiers REQUIRED)
   target_link_libraries(aotdroid_core PUBLIC
     ${FOUNDATION} ${UIKIT} ${METAL} ${METALKIT} ${QUARTZCORE}
-    ${COREVIDEO} ${DISPATCH})
+    ${COREVIDEO} ${DISPATCH} ${UNIFORMTYPEIDENTIFIERS} ${AOTDROID_ZLIB})
   set_target_properties(aotdroid_core PROPERTIES
     OBJCXX_ARC ON
     XCODE_ATTRIBUTE_IPHONEOS_DEPLOYMENT_TARGET "15.0")
 endif()
 
 # ---------------------------------------------------------------------------
-# Host tool: aotdroid-rewrite (offline pipeline driver)
+# Host tools: aotdroid-rewrite (offline pipeline driver) + aotdroid-import
+# (GSI .zip/.img -> rootfs-<tag>.aotpack converter; also used by CI)
 # ---------------------------------------------------------------------------
 add_executable(aotdroid-rewrite src/tools/aotdroid_rewrite_main.cpp)
 target_link_libraries(aotdroid-rewrite PRIVATE aotdroid_core)
+add_executable(aotdroid-import src/tools/import_main.cpp)
+target_link_libraries(aotdroid-import PRIVATE aotdroid_core)
 
 # ---------------------------------------------------------------------------
 # Tests (host + iOS-sim; plain assert binaries, no framework dependency)
@@ -123,6 +137,7 @@ if(NOT AOTDROID_HOST AND CMAKE_SYSTEM_NAME STREQUAL "iOS")
   find_library(F_METALKIT MetalKit REQUIRED)
   find_library(F_QUARTZ QuartzCore REQUIRED)
   find_library(F_COREVIDEO CoreVideo REQUIRED)
+  find_library(F_UTI UniformTypeIdentifiers REQUIRED)
   target_link_libraries(AOTDroid PRIVATE ${F_UIKIT} ${F_METAL} ${F_METALKIT}
-                       ${F_QUARTZ} ${F_COREVIDEO})
+                       ${F_QUARTZ} ${F_COREVIDEO} ${F_UTI} ${AOTDROID_ZLIB})
 endif()

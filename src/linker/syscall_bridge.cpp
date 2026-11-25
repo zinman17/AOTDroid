@@ -727,19 +727,26 @@ extern "C" long aotdroid_syscall_c(long nr, long a0, long a1, long a2,
       st->st_mode = 0100755;
       st->st_blksize = 4096;
       st->st_nlink = 1;
-      if (vn && vn->kind == VNKind::HostFile) {
+      if (vn && vn->cookie == 1) {
+        PackEntry pe;
+        if (rootfsPack().lookup(vn->name, &pe, nullptr)) {
+          st->st_size = (int64_t)pe.size;
+          uint32_t fmt = 0100000;
+          if (pe.flags & kPackFlagDir) fmt = 0040000;
+          else if (pe.flags & kPackFlagSymlink) fmt = 0120000;
+          else if (pe.mode & 0111) fmt = 0100755;
+          st->st_mode = fmt | (pe.mode & 07777);
+          st->st_uid = pe.uid;
+          st->st_gid = pe.gid;
+          st->st_ino = 0x5000 + pe.blobOff / 4096;
+        }
+      } else if (vn && vn->kind == VNKind::HostFile) {
         struct ::stat hs;
         if (::fstat(vn->hostFd, &hs) == 0) {
           st->st_size = hs.st_size;
           st->st_mode = (uint32_t)hs.st_mode;
           st->st_ino = (uint64_t)hs.st_ino;
           st->st_dev = (uint64_t)hs.st_dev;
-        }
-      } else if (vn && vn->cookie == 1) {
-        PackEntry pe;
-        if (rootfsPack().lookup(vn->name, &pe, nullptr)) {
-          st->st_size = (int64_t)pe.size;
-          st->st_mode = 0100755 | (pe.flags & kPackFlagDir ? 0040000 : 0);
         }
       }
       return 0;
@@ -749,9 +756,15 @@ extern "C" long aotdroid_syscall_c(long nr, long a0, long a1, long a2,
       if (!vn) return -EBADF;
       if (vn->cookie == 1) {   // pack directory
         auto entries = rootfsPack().listDir(vn->name);
-        auto isDir = [&](const std::string& nm) {
+        auto entryType = [&](const std::string& nm) -> uint8_t {
           std::string full = vn->name + "/" + nm;
-          return !rootfsPack().lookup(full, nullptr, nullptr);
+          PackEntry pe;
+          if (rootfsPack().lookupRaw(full, &pe, nullptr)) {
+            if (pe.flags & kPackFlagDir) return 4;      // DT_DIR
+            if (pe.flags & kPackFlagSymlink) return 10;  // DT_LNK
+            return 8;                                    // DT_REG
+          }
+          return 4;   // legacy packs without dir entries: subdir name
         };
         uint8_t* out = (uint8_t*)(uintptr_t)a1;
         size_t cap = (size_t)a2, used = 0, i = (size_t)vn->pos;
@@ -764,7 +777,7 @@ extern "C" long aotdroid_syscall_c(long nr, long a0, long a1, long a2,
           d.d_ino = 1000 + i;
           d.d_off = (int64_t)(i + 1);
           d.d_reclen = reclen;
-          d.d_type = (nm == "." || nm == "..") ? 4 : (isDir(nm) ? 4 : 8);
+          d.d_type = (nm == "." || nm == "..") ? 4 : entryType(nm);
           memcpy(d.d_name, nm.c_str(), nm.size() + 1);
           memcpy(out + used, &d, reclen);
           used += reclen;
@@ -796,7 +809,36 @@ extern "C" long aotdroid_syscall_c(long nr, long a0, long a1, long a2,
       }
       return -ENOTDIR;
     }
-    case sys::faccessat: case sys::readlinkat: return -ENOENT;
+    case sys::faccessat: {
+      const char* path = (const char*)(uintptr_t)a1;
+      if (!path) return -EFAULT;
+      std::string p(path);
+      if (rootfsPack().lookup(p, nullptr, nullptr)) return 0;
+      if (::access(paths().translate(p).c_str(), (int)a2) == 0) return 0;
+      return -ENOENT;
+    }
+    case sys::readlinkat: {
+      const char* path = (const char*)(uintptr_t)a1;
+      char* buf = (char*)(uintptr_t)a2;
+      size_t bufsiz = (size_t)a3;
+      if (!path || !buf) return -EFAULT;
+      std::string p(path);
+      PackEntry pe;
+      const uint8_t* data = nullptr;
+      if (!rootfsPack().lookupRaw(p, &pe, &data)) {
+        // host-side symlink? fall back to the container path
+        char tmp[4096];
+        ssize_t r = ::readlink(paths().translate(p).c_str(), tmp, sizeof(tmp) - 1);
+        if (r <= 0) return -ENOENT;
+        size_t n = std::min<size_t>((size_t)r, bufsiz);
+        memcpy(buf, tmp, n);
+        return (long)n;
+      }
+      if (!(pe.flags & kPackFlagSymlink)) return -EINVAL;
+      size_t n = std::min<size_t>((size_t)pe.size, bufsiz);
+      memcpy(buf, data, n);
+      return (long)n;
+    }
     case sys::mkdirat: case sys::unlinkat: case sys::renameat: case sys::fchmodat:
       return -EROFS;
     case sys::getcwd: {

@@ -3,8 +3,10 @@
 // ============================================================================
 #include "vfs.h"
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <cstring>
 
 namespace aotdroid {
 
@@ -155,42 +157,126 @@ std::string PathTranslator::translate(const std::string& linuxPath) const {
 }
 
 // ---------------------------------------------------------------------------
-// PackVFS
+// PackVFS  (mmap-backed: multi-GB GSI packs must not sit on the heap)
 // ---------------------------------------------------------------------------
 PackVFS& rootfsPack() { static PackVFS p; return p; }
 
+PackVFS::~PackVFS() { close(); }
+
+void PackVFS::close() {
+  if (mapBase_) { munmap(mapBase_, mapLen_); mapBase_ = nullptr; }
+  if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
+  mapLen_ = 0;
+  entries_ = nullptr;
+  strs_ = nullptr;
+  sorted_ = false;
+  hdr_ = {};
+}
+
 bool PackVFS::open(const std::string& hostPath, std::string* err) {
-  FILE* f = fopen(hostPath.c_str(), "rb");
-  if (!f) { *err = "open pack"; return false; }
-  fseek(f, 0, SEEK_END);
-  long sz = ftell(f);
-  fseek(f, 0, SEEK_SET);
-  if (sz <= (long)sizeof(PackHeader)) { fclose(f); *err = "pack too small"; return false; }
-  map_.resize((size_t)sz);
-  size_t rd = fread(map_.data(), 1, map_.size(), f);
-  fclose(f);
-  if (rd != map_.size()) { *err = "pack read"; return false; }
-  memcpy(&hdr_, map_.data(), sizeof(hdr_));
-  if (memcmp(hdr_.magic, "AOTPACK1", 8) != 0) { *err = "pack magic"; return false; }
-  entries_ = (const PackEntry*)(map_.data() + hdr_.entryOff);
-  strs_ = (const char*)(map_.data() + hdr_.strOff);
+  close();
+  fd_ = ::open(hostPath.c_str(), O_RDONLY);
+  if (fd_ < 0) { *err = "open pack " + hostPath; return false; }
+  struct stat st {};
+  if (::fstat(fd_, &st) != 0 || st.st_size <= (off_t)sizeof(PackHeader)) {
+    close(); *err = "pack too small"; return false;
+  }
+  mapLen_ = (size_t)st.st_size;
+  mapBase_ = (uint8_t*)mmap(nullptr, mapLen_, PROT_READ, MAP_PRIVATE, fd_, 0);
+  if (mapBase_ == MAP_FAILED) {
+    mapBase_ = nullptr;
+    close(); *err = "mmap pack"; return false;
+  }
+  memcpy(&hdr_, mapBase_, sizeof(hdr_));
+  if (memcmp(hdr_.magic, "AOTPACK1", 8) != 0) { close(); *err = "pack magic"; return false; }
+  if (hdr_.entryOff == 0 || hdr_.entryOff >= mapLen_ ||
+      hdr_.entryOff + (uint64_t)hdr_.entryCount * sizeof(PackEntry) > mapLen_ ||
+      hdr_.strOff >= mapLen_) {
+    close(); *err = "pack header out of range"; return false;
+  }
+  entries_ = (const PackEntry*)(mapBase_ + hdr_.entryOff);
+  strs_ = (const char*)(mapBase_ + hdr_.strOff);
+  sorted_ = true;
+  for (uint32_t i = 1; i < hdr_.entryCount; ++i) {
+    if (strcmp(strs_ + entries_[i - 1].nameOff, strs_ + entries_[i].nameOff) > 0) {
+      sorted_ = false;
+      break;
+    }
+  }
   return true;
+}
+
+bool PackVFS::lookupNormalized(std::string key, PackEntry* out,
+                               const uint8_t** data, bool followSymlinks) const {
+  while (!key.empty() && key.front() == '/') key.erase(key.begin());
+  if (key.empty()) return false;
+  for (int hop = 0; hop < 10; ++hop) {
+    const PackEntry* hit = nullptr;
+    if (sorted_) {
+      uint32_t lo = 0, hi = hdr_.entryCount;
+      while (lo < hi) {
+        uint32_t mid = (lo + hi) / 2;
+        int c = strcmp(strs_ + entries_[mid].nameOff, key.c_str());
+        if (c == 0) { hit = &entries_[mid]; break; }
+        if (c < 0) lo = mid + 1; else hi = mid;
+      }
+    } else {
+      for (uint32_t i = 0; i < hdr_.entryCount; ++i) {
+        if (strcmp(strs_ + entries_[i].nameOff, key.c_str()) == 0) {
+          hit = &entries_[i];
+          break;
+        }
+      }
+    }
+    if (!hit) return false;
+    if ((hit->flags & kPackFlagSymlink) && followSymlinks) {
+      // rewrite key by the link target
+      std::string target((const char*)mapBase_ + hit->blobOff, (size_t)hit->size);
+      if (target.empty()) return false;
+      std::string base;
+      if (target.front() != '/') {
+        size_t slash = key.rfind('/');
+        base = slash == std::string::npos ? "" : key.substr(0, slash);
+      }
+      // lexical normalize base + target
+      std::vector<std::string> parts;
+      auto push = [&](const std::string& seg) {
+        if (seg.empty() || seg == ".") return;
+        if (seg == "..") { if (!parts.empty()) parts.pop_back(); return; }
+        parts.push_back(seg);
+      };
+      if (target.front() != '/') {
+        for (char& c : base) if (c == '/') c = ' ';
+        std::string b;
+        for (char c : base) { if (c == ' ') { push(b); b.clear(); } else b += c; }
+        push(b);
+      }
+      for (char& c : target) if (c == '/') c = ' ';
+      std::string t;
+      for (char c : target) { if (c == ' ') { push(t); t.clear(); } else t += c; }
+      push(t);
+      std::string nk;
+      for (auto& p : parts) nk += p + "/";
+      if (nk.empty()) return false;
+      nk.pop_back();
+      key = nk;
+      continue;
+    }
+    if (out) *out = *hit;
+    if (data) *data = mapBase_ + hit->blobOff;
+    return true;
+  }
+  return false;   // symlink loop
 }
 
 bool PackVFS::lookup(const std::string& linuxPath, PackEntry* out,
                      const uint8_t** data) const {
-  // normalize: strip leading '/' for pack-internal keys
-  std::string key = linuxPath;
-  while (!key.empty() && key.front() == '/') key.erase(key.begin());
-  for (uint32_t i = 0; i < hdr_.entryCount; ++i) {
-    const PackEntry& e = entries_[i];
-    if (strcmp(strs_ + e.nameOff, key.c_str()) == 0) {
-      if (out) *out = e;
-      if (data) *data = map_.data() + e.blobOff;
-      return true;
-    }
-  }
-  return false;
+  return lookupNormalized(linuxPath, out, data, /*followSymlinks=*/true);
+}
+
+bool PackVFS::lookupRaw(const std::string& linuxPath, PackEntry* out,
+                        const uint8_t** data) const {
+  return lookupNormalized(linuxPath, out, data, /*followSymlinks=*/false);
 }
 
 std::vector<std::string> PackVFS::listDir(const std::string& linuxDir) const {

@@ -62,7 +62,40 @@ with your Apple ID at install time. The `BootSelector` key in `Info.plist`
 (`auto | android-7.1 | android-8.1 | android-10`) plus the in-app launcher
 override the automatic SoC-based selection.
 
-## Building rootfs images (needs GSI images)
+## Adding a rootfs on device (the "Add RootFS" button)
+
+The launcher ships without any rootfs — press **`+ Add RootFS`** and pick a
+GSI `.zip` (or a bare `system.img`). The import runs fully on-device:
+
+```
+GSI .zip ──► zip (stored/deflate) ──► Android sparse map ──► read-only ext4
+                                                                   │
+            rootfs-<tag>.aotpack  ◄── blob streamer + symlink store ◄─┘
+            (mmap-served, 16 KiB-aligned exec blobs, sorted entries)
+```
+
+* **Accepted inputs**: GSI zips containing `system.img` (raw **or** sparse
+  ext4 — phh/TrebleDroid, LineageOS, Google GSI), zips with an unpacked
+  `system/` tree, or a bare `.img`. `build.prop`'s `ro.build.version.sdk`
+  picks the profile tag (`android-7.1` / `android-8.1` / `android-10`).
+* **Storage**: the pack is roughly the size of the zip's uncompressed
+  system partition; keep ~2.5x the zip size free. `Remove` deletes pack +
+  manifest.
+* **Offline/CLI**: the same pipeline ships as `aotdroid-import`
+  (`inspect | import | verify`) for desktop pre-conversion:
+
+```bash
+./scripts/host_build.sh -O1
+./build-host/aotdroid-import inspect  system-image.zip
+./build-host/aotdroid-import import  system-image.zip out-dir/
+./build-host/aotdroid-import verify  out-dir/rootfs-android-10.aotpack system/build.prop
+```
+
+The `rootfs-import` CI job proves the pipeline against a **real**
+`mkfs.ext4` image with symlinks, ELF binaries and all three zip encodings
+(stored / deflate / sparse), asserting byte-identical packs and blob hashes.
+
+## Building rootfs images offline (AOT-converted; needs GSI images)
 
 ```bash
 scripts/build_multi_aosp_rootfs.sh --profile 7.1 --image 7.1=~/system-7.1.img
@@ -83,10 +116,12 @@ every code image with `aotdroid-rewrite`, and emits
 
 `.github/workflows/build-ipa.yml` —
 `host-tests` (ubuntu+macos), `rewrite-fixture` (rewrites a genuinely
-assembled arm64 `.so` and verifies the patched bytes), `ios-build` (compiles
-**every** source against the iPhoneOS SDK — the zero-syntax-errors gate — and
-packages `AOTDroid-unsigned.ipa`), `macho-link-check` (Apple `ld` accepts the
-emitted object), `full-ipa` (manual; rootfs images + conversion).
+assembled arm64 `.so` and verifies the patched bytes), `rootfs-import`
+(mkfs.ext4 + sparse + stored/deflate zips -> `aotpack`, byte-verified),
+`ios-build` (compiles **every** source against the iPhoneOS SDK — the
+zero-syntax-errors gate — and packages `AOTDroid-unsigned.ipa`),
+`macho-link-check` (Apple `ld` accepts the emitted object), `full-ipa`
+(manual; rootfs images + conversion).
 
 ## Status / honesty
 

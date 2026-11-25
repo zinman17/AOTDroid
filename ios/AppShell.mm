@@ -1,18 +1,22 @@
 // ============================================================================
 //  AOTDroid-Adaptive-iOS  |  ios/AppShell.mm
-//  UIKit launcher: hardware profiler readout + boot-selector UI + Metal host.
+//  UIKit launcher: hardware profiler readout + ROOTFS MANAGER (pick a GSI
+//  .zip / .img via the document picker; it gets converted on-device into a
+//  rootfs-<tag>.aotpack) + boot selector + Metal host.
 // ============================================================================
 #import <UIKit/UIKit.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #include "../src/profiler/hardware_profiler.h"
 #include "../src/runtime/container_boot.h"
 #include "../src/gfx/hwc_metal_bridge.h"
 #include "../src/jetsam/jetsam_guard.h"
+#include "../src/rootfs/rootfs_manager.h"
 
 @interface AOTDroidAppDelegate : UIResponder <UIApplicationDelegate>
 @property (strong, nonatomic) UIWindow* window;
 @end
 
-@interface AOTDroidViewController : UIViewController
+@interface AOTDroidViewController : UIViewController <UIDocumentPickerDelegate>
 @end
 
 @implementation AOTDroidAppDelegate
@@ -29,8 +33,23 @@
 @implementation AOTDroidViewController {
   UITextView* _log;
   NSDictionary* _profile;
+  UILabel* _title;
+  UILabel* _subtitle;
+  UIView* _rootfsCard;
+  UILabel* _rootfsTitle;
+  UILabel* _rootfsDetail;
+  UIButton* _addBtn;
+  UIButton* _removeBtn;
+  UIButton* _bootBtn;
+  NSMutableArray<UIButton*>* _optionBtns;
+  UIProgressView* _progress;
+  UILabel* _progressLabel;
+  BOOL _importing;
 }
 
+// ---------------------------------------------------------------------------
+// UI construction
+// ---------------------------------------------------------------------------
 - (void)viewDidLoad {
   [super viewDidLoad];
   self.view.backgroundColor = [UIColor colorWithRed:0.05 green:0.07 blue:0.10 alpha:1];
@@ -40,20 +59,107 @@
 
   UILabel* title = [[UILabel alloc] init];
   title.text = @"AOTDroid";
-  title.font = [UIFont systemFontOfSize:34 weight:UIFontWeightBold];
+  title.font = [UIFont systemFontOfSize:30 weight:UIFontWeightBold];
   title.textColor = UIColor.whiteColor;
   [title sizeToFit];
-  title.frame = CGRectMake(20, 70, title.bounds.size.width, title.bounds.size.height);
   [self.view addSubview:title];
+  _title = title;
 
-  _log = [[UITextView alloc] initWithFrame:
-      CGRectMake(20, 120, self.view.bounds.size.width - 40,
-                 self.view.bounds.size.height - 320)];
+  UILabel* sub = [[UILabel alloc] init];
+  sub.text = [NSString stringWithFormat:@"%@  -  %@ (API %@)",
+      _profile[@"profileTag"], _profile[@"displayName"], _profile[@"apiLevel"]];
+  sub.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
+  sub.textColor = [UIColor colorWithWhite:0.7 alpha:1];
+  [sub sizeToFit];
+  [self.view addSubview:sub];
+  _subtitle = sub;
+
+  // --- rootfs status card ---------------------------------------------------
+  UIView* card = [[UIView alloc] init];
+  card.backgroundColor = [UIColor colorWithWhite:0.12 alpha:1];
+  card.layer.cornerRadius = 14;
+  [self.view addSubview:card];
+  _rootfsCard = card;
+
+  _rootfsTitle = [[UILabel alloc] init];
+  _rootfsTitle.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+  _rootfsTitle.textColor = UIColor.whiteColor;
+  _rootfsTitle.numberOfLines = 0;
+  [card addSubview:_rootfsTitle];
+
+  _rootfsDetail = [[UILabel alloc] init];
+  _rootfsDetail.font = [UIFont fontWithName:@"Menlo" size:11];
+  _rootfsDetail.textColor = [UIColor colorWithWhite:0.62 alpha:1];
+  _rootfsDetail.numberOfLines = 0;
+  [card addSubview:_rootfsDetail];
+
+  // --- import progress ------------------------------------------------------
+  _progress = [[UIProgressView alloc] initWithProgressViewStyle:UIProgressViewStyleDefault];
+  _progress.progressTintColor = [UIColor colorWithRed:0.2 green:0.7 blue:0.4 alpha:1];
+  _progress.hidden = YES;
+  [self.view addSubview:_progress];
+
+  _progressLabel = [[UILabel alloc] init];
+  _progressLabel.font = [UIFont fontWithName:@"Menlo" size:11];
+  _progressLabel.textColor = [UIColor colorWithWhite:0.7 alpha:1];
+  _progressLabel.hidden = YES;
+  [self.view addSubview:_progressLabel];
+
+  // --- buttons --------------------------------------------------------------
+  _addBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+  _addBtn.backgroundColor = [UIColor colorWithRed:0.13 green:0.35 blue:0.62 alpha:1];
+  _addBtn.layer.cornerRadius = 12;
+  _addBtn.tintColor = UIColor.whiteColor;
+  _addBtn.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+  [_addBtn setTitle:@"+  Add RootFS" forState:UIControlStateNormal];
+  [_addBtn addTarget:self action:@selector(addRootfsTapped:)
+      forControlEvents:UIControlEventTouchUpInside];
+  [self.view addSubview:_addBtn];
+
+  _removeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+  _removeBtn.backgroundColor = [UIColor colorWithWhite:0.2 alpha:1];
+  _removeBtn.layer.cornerRadius = 12;
+  _removeBtn.tintColor = [UIColor colorWithRed:0.95 green:0.45 blue:0.45 alpha:1];
+  _removeBtn.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
+  [_removeBtn setTitle:@"Remove" forState:UIControlStateNormal];
+  [_removeBtn addTarget:self action:@selector(removeRootfsTapped:)
+      forControlEvents:UIControlEventTouchUpInside];
+  [self.view addSubview:_removeBtn];
+
+  _optionBtns = [NSMutableArray array];
+  NSArray* options = @[@"auto", @"7.1", @"8.1", @"10"];
+  for (NSUInteger i = 0; i < options.count; ++i) {
+    UIButton* b = [UIButton buttonWithType:UIButtonTypeSystem];
+    b.tag = 100 + (NSInteger)i;
+    b.backgroundColor = [UIColor colorWithWhite:0.22 alpha:1];
+    b.layer.cornerRadius = 10;
+    b.tintColor = UIColor.whiteColor;
+    b.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
+    [b setTitle:options[i] forState:UIControlStateNormal];
+    [b addTarget:self action:@selector(bootOption:)
+        forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:b];
+    [_optionBtns addObject:b];
+  }
+
+  _bootBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+  _bootBtn.backgroundColor = [UIColor colorWithRed:0.1 green:0.55 blue:0.25 alpha:1];
+  _bootBtn.layer.cornerRadius = 14;
+  _bootBtn.tintColor = UIColor.whiteColor;
+  _bootBtn.titleLabel.font = [UIFont systemFontOfSize:19 weight:UIFontWeightBold];
+  [_bootBtn setTitle:@"Boot Container" forState:UIControlStateNormal];
+  [_bootBtn addTarget:self action:@selector(bootNow:)
+      forControlEvents:UIControlEventTouchUpInside];
+  [self.view addSubview:_bootBtn];
+
+  // --- console --------------------------------------------------------------
+  _log = [[UITextView alloc] init];
   _log.editable = NO;
   _log.textColor = [UIColor colorWithRed:0.8 green:0.9 blue:0.8 alpha:1];
-  _log.font = [UIFont fontWithName:@"Menlo" size:12];
+  _log.font = [UIFont fontWithName:@"Menlo" size:11];
   _log.backgroundColor = [UIColor colorWithWhite:0 alpha:0.4];
   _log.layer.cornerRadius = 12;
+  _log.layoutManager.allowsNonContiguousLayout = NO;
   [self.view addSubview:_log];
 
   NSMutableString* s = [NSMutableString string];
@@ -61,56 +167,210 @@
   [s appendFormat:@"RAM        : %.0f MB  available %.0f MB\n",
       ((NSNumber*)probe[@"memSize"]).doubleValue / 1048576.0,
       ((NSNumber*)probe[@"procAvailable"]).doubleValue / 1048576.0];
-  [s appendFormat:@"Page size  : %@\n", probe[@"pageSize"]];
-  [s appendFormat:@"Cores      : %@\n", probe[@"cores"]];
-  [s appendFormat:@"Tier       : %@\n", ((NSNumber*)probe[@"tier"]).intValue == 2
-      ? @"Tier 2 (A14/M1+ -> Android 10)" : @"Tier 1 (A13- -> Android 7.1/8.1)"];
-  [s appendFormat:@"Selection  : %@\n", _profile[@"displayName"]];
-  [s appendFormat:@"Profile    : %@ (API %@)\n", _profile[@"profileTag"],
-      _profile[@"apiLevel"]];
-  [s appendFormat:@"Rootfs     : %@\n", _profile[@"rootfsImage"]];
-  [s appendFormat:@"ART heap   : %@\n", _profile[@"artHeapOpts"]];
+  [s appendFormat:@"Cores      : %@   tier %@\n", probe[@"cores"],
+      ((NSNumber*)_profile[@"tier"]).intValue == 2 ? @"2 (A14+)" : @"1 (A13-)"];
+  [s appendFormat:@"Selection  : %@  RSS budget %@ MB\n",
+      _profile[@"profileTag"], _profile[@"rssBudgetMB"]];
   [s appendFormat:@"Framebuffer: %@x%@\n", _profile[@"fbW"], _profile[@"fbH"]];
   _log.text = s;
 
-  NSArray* options = @[@"auto", @"android-7.1", @"android-8.1", @"android-10"];
-  for (NSUInteger i = 0; i < options.count; ++i) {
-    UIButton* b = [UIButton buttonWithType:UIButtonTypeSystem];
-    b.tag = 100 + (NSInteger)i;
-    b.frame = CGRectMake(20 + (CGFloat)i * ((self.view.bounds.size.width - 50) / 4) + 4,
-                         self.view.bounds.size.height - 170,
-                         (self.view.bounds.size.width - 50) / 4 - 8, 56);
-    b.backgroundColor = [UIColor colorWithWhite:0.25 alpha:1];
-    b.layer.cornerRadius = 12;
-    b.tintColor = UIColor.whiteColor;
-    b.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
-    [b setTitle:options[i] forState:UIControlStateNormal];
-    [b addTarget:self action:@selector(bootOption:) forControlEvents:UIControlEventTouchUpInside];
-    [self.view addSubview:b];
-  }
-
-  UIButton* boot = [UIButton buttonWithType:UIButtonTypeSystem];
-  boot.frame = CGRectMake(20, self.view.bounds.size.height - 100,
-                          self.view.bounds.size.width - 40, 64);
-  boot.backgroundColor = [UIColor colorWithRed:0.1 green:0.55 blue:0.25 alpha:1];
-  boot.layer.cornerRadius = 14;
-  boot.tintColor = UIColor.whiteColor;
-  boot.titleLabel.font = [UIFont systemFontOfSize:20 weight:UIFontWeightBold];
-  [boot setTitle:@"Boot Container" forState:UIControlStateNormal];
-  [boot addTarget:self action:@selector(bootNow:) forControlEvents:UIControlEventTouchUpInside];
-  [self.view addSubview:boot];
+  [self layoutAll];
+  [self refreshRootfsCard];
 }
 
+- (void)viewWillLayoutSubviews {
+  [super viewWillLayoutSubviews];
+  [self layoutAll];
+}
+
+- (void)layoutAll {
+  CGFloat W = self.view.bounds.size.width, H = self.view.bounds.size.height;
+  CGFloat x = 16, w = W - 32;
+
+  _title.frame = CGRectMake(x, 54, w, 34);
+  _subtitle.frame = CGRectMake(x, 88, w, 16);
+
+  CGFloat y = 112;
+  _rootfsCard.frame = CGRectMake(x, y, w, 86);
+  _rootfsTitle.frame = CGRectMake(12, 10, w - 24, 20);
+  _rootfsDetail.frame = CGRectMake(12, 34, w - 24, 44);
+
+  y += 86 + 10;
+  _progress.frame = CGRectMake(x, y, w, 4);
+  _progressLabel.frame = CGRectMake(x, y + 8, w, 14);
+
+  y += 30;
+  CGFloat half = (w - 10) / 2;
+  _addBtn.frame = CGRectMake(x, y, half, 46);
+  _removeBtn.frame = CGRectMake(x + half + 10, y, half, 46);
+
+  y += 46 + 10;
+  CGFloat q = (w - 30) / 4;
+  for (NSUInteger i = 0; i < _optionBtns.count; ++i)
+    _optionBtns[i].frame = CGRectMake(x + (CGFloat)i * (q + 10), y, q, 38);
+
+  y += 38 + 10;
+  _bootBtn.frame = CGRectMake(x, y, w, 56);
+
+  y += 56 + 10;
+  _log.frame = CGRectMake(x, y, w, H - y - 24);
+}
+
+// ---------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------
+- (void)logLine:(NSString*)line {
+  dispatch_async(dispatch_get_main_queue(), ^{
+    NSMutableString* s = [_log.text mutableCopy];
+    if (s.length) [s appendString:@"\n"];
+    [s appendString:line];
+    _log.text = s;
+    [_log scrollRangeToVisible:NSMakeRange(_log.text.length, 0)];
+  });
+}
+
+- (void)refreshRootfsCard {
+  aotdroid::RootfsStatus st =
+      aotdroid::RootfsManager::get().status([NSHomeDirectory() UTF8String]);
+  if (!st.installed) {
+    _rootfsTitle.text = @"No rootfs installed";
+    _rootfsDetail.text = @"tap '+ Add RootFS' and pick a GSI .zip "
+                         "(system.img inside) or .img";
+    _bootBtn.alpha = 0.45;
+    _bootBtn.enabled = NO;
+    _removeBtn.enabled = NO;
+  } else {
+    _rootfsTitle.text = [NSString stringWithFormat:@"RootFS: %@  (Android %@)",
+        [NSString stringWithUTF8String:st.profileTag.c_str()],
+        [NSString stringWithUTF8String:st.androidVersion.c_str()]];
+    _rootfsDetail.text = [NSString stringWithFormat:
+        @"API %d   %llu MB   %u files / %u dirs / %u links\n%@",
+        st.apiLevel, (unsigned long long)(st.packBytes / 1048576),
+        st.fileCount, st.dirCount, st.symlinkCount,
+        [NSString stringWithUTF8String:st.fingerprint.c_str()]];
+    _bootBtn.alpha = 1.0;
+    _bootBtn.enabled = YES;
+    _removeBtn.enabled = YES;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Add RootFS: document picker -> background import -> pack
+// ---------------------------------------------------------------------------
+- (void)addRootfsTapped:(UIButton*)sender {
+  (void)sender;
+  if (_importing) return;
+  UIDocumentPickerViewController* picker =
+      [[UIDocumentPickerViewController alloc]
+          initWithForOpeningContentTypes:@[UTType.data]
+                           asCopy:YES];   // picker copies into our tmp; no scope dance
+  picker.delegate = self;
+  picker.allowsMultipleSelection = NO;
+  [self presentViewController:picker animated:YES completion:nil];
+}
+
+- (void)documentPicker:(UIDocumentPickerViewController*)controller
+    didPickDocumentsAtURLs:(NSArray<NSURL*>*)urls {
+  (void)controller;
+  if (urls.count == 0) return;
+  [self startImportFrom:urls.firstObject];
+}
+
+- (void)documentPickerWasCancelled:(UIDocumentPickerViewController*)controller {
+  (void)controller;
+}
+
+- (void)startImportFrom:(NSURL*)url {
+  NSString* src = url.path;
+  uint64_t srcBytes = [[[NSFileManager defaultManager]
+      attributesOfItemAtPath:src error:nil] fileSize].unsignedLongLongValue;
+  uint64_t freeBytes = 0;
+  NSError* fsErr = nil;
+  NSDictionary* fsAttrs = [[NSFileManager defaultManager]
+      attributesOfFileSystemForPath:NSHomeDirectory() error:&fsErr];
+  if (fsAttrs) freeBytes = [fsAttrs[NSFileSystemFreeSize] unsignedLongLongValue];
+  [self logLine:[NSString stringWithFormat:
+      @"[rootfs] importing %@ (%llu MB; %llu MB free)...",
+      url.lastPathComponent, srcBytes / 1048576, freeBytes / 1048576]];
+  if (freeBytes && srcBytes * 2 + (512ULL << 20) > freeBytes) {
+    [self logLine:@"[rootfs] WARNING: low free space; import may fail"];
+  }
+
+  _importing = YES;
+  _progress.hidden = NO;
+  _progressLabel.hidden = NO;
+  _progress.progress = 0;
+  _progressLabel.text = @"inspecting...";
+  _addBtn.enabled = NO;
+  _bootBtn.enabled = NO;
+  _removeBtn.enabled = NO;
+
+  dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+  dispatch_async(q, ^{
+    std::string err;
+    __weak typeof(self) weakSelf = self;
+    bool ok = aotdroid::RootfsManager::get().importTo(
+        [src UTF8String], [NSHomeDirectory() UTF8String],
+        [weakSelf](const aotdroid::ImportProgress& p) {
+          dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(self) self = weakSelf;
+            if (!self) return;
+            self->_progress.progress = p.fraction;
+            self->_progressLabel.text = [NSString stringWithFormat:
+                @"[%s] %.0f%%  (%llu / %llu MB)",
+                p.phase.c_str(), p.fraction * 100.0,
+                (unsigned long long)(p.bytesDone / 1048576),
+                (unsigned long long)(p.bytesTotal / 1048576)];
+          });
+        }, &err);
+    // remove the picker's tmp copy
+    [[NSFileManager defaultManager] removeItemAtPath:src error:nil];
+    dispatch_async(dispatch_get_main_queue(), ^{
+      __strong typeof(self) self = weakSelf;
+      if (!self) return;
+      self->_importing = NO;
+      self->_progress.hidden = YES;
+      self->_progressLabel.hidden = YES;
+      self->_addBtn.enabled = YES;
+      if (ok) {
+        aotdroid::RootfsStatus st = aotdroid::RootfsManager::get().status(
+            [NSHomeDirectory() UTF8String]);
+        [self logLine:[NSString stringWithFormat:
+            @"[rootfs] installed %@ (Android %@, API %d): %u files, %llu MB pack",
+            [NSString stringWithUTF8String:st.profileTag.c_str()],
+            [NSString stringWithUTF8String:st.androidVersion.c_str()],
+            st.apiLevel, st.fileCount,
+            (unsigned long long)(st.packBytes / 1048576)]];
+      } else {
+        [self logLine:[NSString stringWithFormat:@"[rootfs] FAILED: %s",
+            err.c_str()]];
+      }
+      [self refreshRootfsCard];
+    });
+  });
+}
+
+- (void)removeRootfsTapped:(UIButton*)sender {
+  (void)sender;
+  std::string err;
+  bool had = aotdroid::RootfsManager::get().remove([NSHomeDirectory() UTF8String],
+                                                   &err);
+  [self logLine:had ? @"[rootfs] removed (rootfs-*.aotpack + manifest deleted)"
+                    : @"[rootfs] nothing to remove"];
+  [self refreshRootfsCard];
+}
+
+// ---------------------------------------------------------------------------
+// Boot
+// ---------------------------------------------------------------------------
 - (void)bootOption:(UIButton*)sender {
   NSArray* options = @[@"auto", @"android-7.1", @"android-8.1", @"android-10"];
   NSString* choice = options[sender.tag - 100];
   [[NSUserDefaults standardUserDefaults] setObject:choice
                                             forKey:@"AOTDroidBootOverride"];
   _profile = [[AOTDroidProfiler shared] selectProfile];
-  NSMutableString* s = [_log.text mutableCopy];
-  [s appendFormat:@"\n[override] %@ -> %@ (%@ MB budget)", choice,
-      _profile[@"profileTag"], _profile[@"rssBudgetMB"]];
-  _log.text = s;
+  [self logLine:[NSString stringWithFormat:@"[override] %@ -> %@ (%@ MB budget)",
+      choice, _profile[@"profileTag"], _profile[@"rssBudgetMB"]]];
 }
 
 - (void)bootNow:(UIButton*)sender {
@@ -118,26 +378,24 @@
   // 1. Jetsam guard first: never allocate before the pressure hooks exist.
   aotdroid::jetsamGuardInstall(nil);
 
-  // 2. Container boot: rootfs pack + binder domains + properties + init.
+  // 2. Container boot: installed rootfs pack + binder domains + properties + init.
   aotdroid::BootConfig cfg;
   cfg.apiLevel = ((NSNumber*)_profile[@"apiLevel"]).unsignedIntValue;
   cfg.profileTag = [_profile[@"profileTag"] UTF8String];
-  cfg.containerRoot =
-      [NSHomeDirectory() UTF8String];   // app sandbox container
+  cfg.containerRoot = [NSHomeDirectory() UTF8String];   // app sandbox container
   aotdroid::BootResult r = aotdroid::containerBoot(cfg);
-  NSMutableString* s = [_log.text mutableCopy];
   if (r.ok) {
-    [s appendFormat:@"\n[boot] container up (init domain %u, %zu property bytes)",
-        r.initDomain, r.propertyBytes];
+    [self logLine:[NSString stringWithFormat:
+        @"[boot] container up (init domain %u, %zu property bytes)",
+        r.initDomain, r.propertyBytes]];
     // 3. Metal presentation host at the profiled framebuffer geometry.
     aotdroid::hwcMetalAttachToView((__bridge void*)self,
                          ((NSNumber*)_profile[@"fbW"]).unsignedIntValue,
                          ((NSNumber*)_profile[@"fbH"]).unsignedIntValue,
                          96 * 1024 * 1024);
   } else {
-    [s appendFormat:@"\n[boot] FAILED: %s", r.error.c_str()];
+    [self logLine:[NSString stringWithFormat:@"[boot] FAILED: %s", r.error.c_str()]];
   }
-  _log.text = s;
 }
 
 @end

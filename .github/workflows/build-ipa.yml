@@ -6,6 +6,9 @@
 #    rewrite-fixture (ubuntu): assemble a real arm64 .so with the cross
 #                     assembler, run aotdroid-rewrite over it, verify the
 #                     patched bytes with python (site -> veneer chains)
+#    rootfs-import   (ubuntu): build a real GSI-like fixture (mkfs.ext4 +
+#                     sparse + stored/deflate zips) and run the on-device
+#                     import pipeline (zip -> sparse -> ext4 -> aotpack)
 #    ios-build       (macos-latest): compile EVERY source (incl. .mm) against the
 #                     iPhoneOS SDK -> proof of zero syntax errors; package the
 #                     unsigned AOTDroid.app into AOTDroid-unsigned.ipa for
@@ -47,6 +50,9 @@ jobs:
           uname -a
           c++ --version | head -1
           cmake --version | head -1
+      - name: Install zlib headers (linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends zlib1g-dev
       - name: Build + run (script path; no cmake needed)
         run: ./scripts/host_build.sh
       - name: Build + run (cmake path)
@@ -138,6 +144,138 @@ jobs:
           PY
 
   # ---------------------------------------------------------------------------
+  rootfs-import:
+    name: GSI import pipeline (zip/sparse/ext4 -> aotpack)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install fixture tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends e2fsprogs zip zlib1g-dev python3
+      - name: Build host tools
+        run: ./scripts/host_build.sh -O1
+      - name: Build a REAL GSI-like image (mkfs.ext4 + symlinks + ELF)
+        run: |
+          set -e
+          mkdir -p fixture/rootfs/system/bin fixture/rootfs/system/lib \
+                   fixture/rootfs/system/etc fixture/rootfs/system/framework \
+                   fixture/rootfs/system/app/com.aot.test
+          cat > fixture/rootfs/system/build.prop <<'EOF'
+          ro.build.version.sdk=27
+          ro.build.version.release=8.1.0
+          ro.build.fingerprint=aotdroid/ci/gsi:8.1.0/CI/1:test-keys
+          EOF
+          cp build-host/test_property_trie fixture/rootfs/system/bin/aot_ci_test
+          chmod 755 fixture/rootfs/system/bin/aot_ci_test
+          printf '\x7fELF_ci_so_payload' > fixture/rootfs/system/lib/libcitest.so
+          chmod 644 fixture/rootfs/system/lib/libcitest.so
+          head -c 250000 /dev/urandom > fixture/rootfs/system/framework/boot.art
+          head -c 900000 /dev/urandom > fixture/rootfs/system/app/com.aot.test/base.apk
+          echo "ci=1" > fixture/rootfs/system/etc/config.ini
+          ln -s ../lib/libcitest.so fixture/rootfs/system/bin/so_lnk
+          ln -s /system/bin/aot_ci_test fixture/rootfs/system/bin/sh
+          # real ext4 filesystem (extents + metadata_csum defaults of mke2fs)
+          mkfs.ext4 -q -b 4096 -d fixture/rootfs fixture/system.img 8M
+          # three GSI zip variants exactly like the wild:
+          ( cd fixture && zip -qr0y gsi-stored.zip system.img )
+          ( cd fixture && zip -qr9y gsi-deflate.zip system.img )
+          # sparse variant: python converts raw ext4 -> Android sparse (raw/fill/dont-care)
+          python3 - <<'PY'
+          import struct
+          raw = open('fixture/system.img','rb').read()
+          BS = 4096
+          nb = len(raw)//BS
+          chunks = []
+          i = 0
+          while i < nb:
+              b = raw[i*BS:(i+1)*BS]
+              if b == b'\0'*BS:
+                  r = 0
+                  while i+r < nb and raw[(i+r)*BS:(i+r+1)*BS] == b'\0'*BS: r += 1
+                  chunks.append((0xCAC3, r, None)); i += r
+              else:
+                  r = 0
+                  while i+r < nb and raw[(i+r)*BS:(i+r+1)*BS] != b'\0'*BS: r += 1
+                  chunks.append((0xCAC1, r, raw[i*BS:(i+r)*BS])); i += r
+          out = bytearray()
+          out += struct.pack('<IHHHH', 0xED26FF3A, 1, 1, 28, 8)
+          out += struct.pack('<IIII', BS, nb, len(chunks), 0)
+          for t, n, d in chunks:
+              out += struct.pack('<HHI', t, 0, n)
+              if t == 0xCAC1: out += d
+          open('fixture/system-sparse.img','wb').write(bytes(out))
+          print('sparse chunks:', len(chunks))
+          PY
+          # sparse zip must carry it as system.img (what the importer expects)
+          ( cd fixture && mkdir -p ren && cp system-sparse.img ren/system.img && \
+            cd ren && zip -qr0y ../gsi-sparse.zip system.img )
+          ls -la fixture/*.zip
+      - name: Import all three variants + verify
+        run: |
+          set -e
+          mkdir -p out1 out2 out3
+          ./build-host/aotdroid-import import fixture/gsi-stored.zip out1
+          ./build-host/aotdroid-import import fixture/gsi-deflate.zip out2
+          ./build-host/aotdroid-import import fixture/gsi-sparse.zip out3
+          ./build-host/aotdroid-import verify out1/rootfs-android-8.1.aotpack system/build.prop
+          ./build-host/aotdroid-import verify out2/rootfs-android-8.1.aotpack system/bin/aot_ci_test
+          ./build-host/aotdroid-import verify out3/rootfs-android-8.1.aotpack system/etc/config.ini
+      - name: Assert pack correctness (python)
+        run: |
+          python3 - <<'PY'
+          import struct, hashlib
+          packs = ['out1/rootfs-android-8.1.aotpack', 'out2/rootfs-android-8.1.aotpack',
+                   'out3/rootfs-android-8.1.aotpack']
+          ents = {}
+          for p in packs:
+              d = open(p,'rb').read()
+              assert d[:8] == b'AOTPACK1'
+              cnt, = struct.unpack_from('<I', d, 12)
+              strOff, entryOff, blobOff = struct.unpack_from('<QQQ', d, 16)
+              m = {}
+              for i in range(cnt):
+                  o = entryOff + i*40
+                  nOff, mode, uid, gid = struct.unpack_from('<IIII', d, o)
+                  bo, sz = struct.unpack_from('<QQ', d, o+16)
+                  fl, = struct.unpack_from('<I', d, o+32)
+                  nm = d[strOff+nOff:d.index(b'\0', strOff+nOff)].decode()
+                  m[nm] = (bo, sz, fl, mode)
+              ents[p] = m
+          base = ents[packs[0]]
+          # all three variants must agree
+          for p in packs[1:]:
+              assert set(ents[p]) == set(base), (p, 'entry sets differ')
+              for k in base:
+                  a, b = base[k], ents[p][k]
+                  assert a[1] == b[1] and a[2] == b[2], (k, a, b)
+          print('entry sets identical across stored/deflate/sparse:', len(base))
+          # required content
+          assert 'system/build.prop' in base
+          assert 'system/bin/aot_ci_test' in base
+          assert 'system/app/com.aot.test/base.apk' in base
+          assert 'system/bin/sh' in base
+          bo, sz, fl, md = base['system/bin/sh']
+          assert fl & 4, 'sh must be a symlink'
+          d0 = open(packs[0],'rb').read()
+          bo, sz, fl, md = base['system/bin/sh']
+          assert d0[bo:bo+sz] == b'/system/bin/aot_ci_test'
+          bo, sz, fl, md = base['system/bin/so_lnk']
+          assert d0[bo:bo+sz] == b'../lib/libcitest.so', d0[bo:bo+sz]
+          # ELF exec flag + 16KiB alignment
+          bo, sz, fl, md = base['system/bin/aot_ci_test']
+          assert fl & 1 and bo % 16384 == 0, (fl, bo)
+          # build.prop content
+          bo, sz, fl, md = base['system/build.prop']
+          assert b'ro.build.version.sdk=27' in d0[bo:bo+sz]
+          # blob integrity vs source file
+          src = open('fixture/rootfs/system/bin/aot_ci_test','rb').read()
+          bo, sz, fl, md = base['system/bin/aot_ci_test']
+          assert hashlib.sha256(d0[bo:bo+sz]).hexdigest() == hashlib.sha256(src).hexdigest()
+          print('ROOTFS IMPORT PIPELINE: all assertions passed')
+          PY
+
+  # ---------------------------------------------------------------------------
   ios-build:
     name: iOS build (zero-syntax-errors gate)
     runs-on: macos-latest
@@ -160,7 +298,10 @@ jobs:
                    src/runtime/property_area.cpp src/runtime/domain.cpp \
                    src/runtime/container_boot.cpp \
                    src/linker/syscall_bridge.cpp src/linker/bionic_linker.cpp \
-                   src/gfx/input_hub.cpp src/gfx/hwc_composer_core.cpp; do
+                   src/gfx/input_hub.cpp src/gfx/hwc_composer_core.cpp \
+                   src/rootfs/zip_reader.cpp src/rootfs/sparse_image.cpp \
+                   src/rootfs/ext4_reader.cpp src/rootfs/pack_writer.cpp \
+                   src/rootfs/rootfs_manager.cpp; do
             xcrun -sdk iphoneos clang++ -std=c++20 -stdlib=libc++ \
               -arch arm64 -mcpu=apple-a13 -fobjc-arc \
               -isysroot "$SDK" -DTARGET_OS_IPHONE=1 \
@@ -187,6 +328,8 @@ jobs:
             build-ios/obj/*.o \
             -framework Foundation -framework UIKit -framework Metal \
             -framework MetalKit -framework QuartzCore -framework CoreVideo \
+            -framework UniformTypeIdentifiers \
+            -lz \
             -o build-ios/AOTDroid.app/AOTDroid \
             -Wl,-no_fixup_chains
           cp ios/Info.plist build-ios/AOTDroid.app/
