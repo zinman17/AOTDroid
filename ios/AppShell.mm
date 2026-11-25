@@ -260,10 +260,14 @@
 - (void)addRootfsTapped:(UIButton*)sender {
   (void)sender;
   if (_importing) return;
-  UIDocumentPickerViewController* picker =
-      [[UIDocumentPickerViewController alloc]
-          initWithForOpeningContentTypes:@[[UTType typeWithIdentifier:@"public.data"]]
-                           asCopy:YES];   // picker copies into our tmp; no scope dance
+  UIDocumentPickerViewController* picker;
+  if (@available(iOS 14.0, *)) {
+    picker = [[UIDocumentPickerViewController alloc]
+        initWithForOpeningContentTypes:@[[UTType typeWithIdentifier:@"public.data"]]];
+  } else {
+    picker = [[UIDocumentPickerViewController alloc]
+        initWithDocumentTypes:@[@"public.data"] inMode:UIDocumentPickerModeOpen];
+  }
   picker.delegate = self;
   picker.allowsMultipleSelection = NO;
   [self presentViewController:picker animated:YES completion:nil];
@@ -273,14 +277,17 @@
     didPickDocumentsAtURLs:(NSArray<NSURL*>*)urls {
   (void)controller;
   if (urls.count == 0) return;
-  [self startImportFrom:urls.firstObject];
+  NSURL* url = urls.firstObject;
+  // open-in-place: hold the security scope for the whole background import
+  BOOL scoped = [url startAccessingSecurityScopedResource];
+  [self startImportFrom:url stopScope:scoped];
 }
 
 - (void)documentPickerWasCancelled:(UIDocumentPickerViewController*)controller {
   (void)controller;
 }
 
-- (void)startImportFrom:(NSURL*)url {
+- (void)startImportFrom:(NSURL*)url stopScope:(BOOL)scoped {
   NSString* src = url.path;
   NSDictionary* fattrs = [[NSFileManager defaultManager]
       attributesOfItemAtPath:src error:nil];
@@ -323,8 +330,8 @@
                 (unsigned long long)(p.bytesTotal / 1048576)];
           });
         }, &err);
-    // remove the picker's tmp copy
-    [[NSFileManager defaultManager] removeItemAtPath:src error:nil];
+    // release the provider's file (and drop any tmp copy the picker made)
+    if (scoped) [url stopAccessingSecurityScopedResource];
     dispatch_async(dispatch_get_main_queue(), ^{
       AOTDroidViewController* s = weakSelf;
       if (!s) return;
