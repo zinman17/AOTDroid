@@ -79,7 +79,7 @@ __asm__(
   "  ldr x4, [sp, #16]\n"          // a3
   "  ldr x5, [sp, #24]\n"          // a4
   "  ldr x6, [sp, #32]\n"          // a5
-  "  bl  __aotdroid_syscall_c\n"
+  "  bl  _aotdroid_syscall_c\n"
   "  ldp x1, x2,  [sp, #0]\n"
   "  ldp x3, x4,  [sp, #16]\n"
   "  ldp x5, x6,  [sp, #32]\n"
@@ -92,16 +92,20 @@ __asm__(
   "  add sp, sp, #144\n"
   "  ret\n"
 );
-extern "C" long __aotdroid_syscall_c(long nr, long a0, long a1, long a2,
-                                     long a3, long a4, long a5);
+extern "C" long aotdroid_syscall_c(long nr, long a0, long a1, long a2,
+                                 long a3, long a4, long a5);
 [[maybe_unused]] static long dispatch(long nr, long a0, long a1, long a2, long a3, long a4,
                      long a5) {
-  return __aotdroid_syscall_c(nr, a0, a1, a2, a3, a4, a5);
+  return aotdroid_syscall_c(nr, a0, a1, a2, a3, a4, a5);
 }
 #else
+// No asm trampoline on this target: the public entry is an alias of the C
+// dispatcher, defined after the dispatcher body below.
+extern "C" long aotdroid_syscall_c(long nr, long a0, long a1, long a2,
+                                 long a3, long a4, long a5);
 [[maybe_unused]] static long dispatch(long nr, long a0, long a1, long a2, long a3, long a4,
                      long a5) {
-  return aotdroid_syscall_bridge(nr, a0, a1, a2, a3, a4, a5);
+  return aotdroid_syscall_c(nr, a0, a1, a2, a3, a4, a5);
 }
 #endif
 
@@ -572,8 +576,8 @@ std::string synthContent(const VNode* n) {
 // ===========================================================================
 // The dispatcher
 // ===========================================================================
-extern "C" long aotdroid_syscall_bridge(long nr, long a0, long a1, long a2,
-                                        long a3, long a4, long a5) {
+extern "C" long aotdroid_syscall_c(long nr, long a0, long a1, long a2,
+                                 long a3, long a4, long a5) {
   switch (nr) {
     // ---- identity / proc -------------------------------------------------
     case sys::getpid:  return (long)domains().currentPid();
@@ -694,9 +698,9 @@ extern "C" long aotdroid_syscall_bridge(long nr, long a0, long a1, long a2,
       int cnt = (int)a2;
       long total = 0;
       for (int i = 0; i < cnt; ++i) {
-        long r = aotdroid_syscall_bridge(nr == sys::writev ? sys::write : sys::read,
-                                         a0, (long)(uintptr_t)iov[i].iov_base,
-                                         (long)iov[i].iov_len, 0, 0, 0);
+        long r = aotdroid_syscall_c(nr == sys::writev ? sys::write : sys::read,
+                                    a0, (long)(uintptr_t)iov[i].iov_base,
+                                    (long)iov[i].iov_len, 0, 0, 0);
         if (r < 0) return total ? total : r;
         total += r;
         if ((size_t)r < iov[i].iov_len) break;
@@ -1080,5 +1084,17 @@ void syscallBridgeInit() {
   sigChainInstall();
   BinderEmu::get().initContexts();
 }
+
+#if !(defined(__aarch64__) && defined(AOTDROID_APPLE))
+// On non-arm64-Apple targets there is no asm trampoline: the public entry
+// declared in the header is a plain alias of the C dispatcher. (On arm64
+// Apple builds the __asm__ trampoline above provides _aotdroid_syscall_bridge
+// and tail-calls the dispatcher, preserving the Linux syscall register
+// contract -- defining it again here would collide.)
+extern "C" long aotdroid_syscall_bridge(long nr, long a0, long a1, long a2,
+                                       long a3, long a4, long a5) {
+  return aotdroid_syscall_c(nr, a0, a1, a2, a3, a4, a5);
+}
+#endif
 
 }  // namespace aotdroid
